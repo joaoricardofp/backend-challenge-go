@@ -6,7 +6,9 @@ import (
 	"net/http"
 	"os"
 
+	"github.com/joaoricardofp/backend-challenge-go/internal/application"
 	"github.com/joaoricardofp/backend-challenge-go/internal/repository/postgres"
+	wagerhttp "github.com/joaoricardofp/backend-challenge-go/internal/transport/http"
 )
 
 func main() {
@@ -23,6 +25,12 @@ func main() {
 	}
 	defer pool.Close()
 
+	wallets := postgres.NewWalletRepository(pool)
+	transactions := postgres.NewWagerTransactionRepository(pool)
+	ledger := postgres.NewLedgerRepository(pool)
+	service := application.NewWagerService(pool, wallets, transactions, ledger)
+	wagerHandler := wagerhttp.NewWagerHandler(service)
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
@@ -30,6 +38,8 @@ func main() {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"status":"ok"}`))
 	})
+
+	mux.HandleFunc("POST /wagering/transactions", wagerHandler.ProcessWager)
 
 	log.Printf("Server started on :8080")
 
