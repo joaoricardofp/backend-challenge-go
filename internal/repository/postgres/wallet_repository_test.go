@@ -399,3 +399,53 @@ func TestWalletRepository_GetByIDForUpdate_WaitsForLockRelease(t *testing.T) {
 		t.Fatal("tx2 did not continue after tx1 committed")
 	}
 }
+
+func TestWalletRepository_Update(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	repo := postgres.NewWalletRepository(pool)
+
+	wallet := mustCreateWallet(t, pool, repo) // BRL, saldo 12345, version 1
+
+	// Update roda na mesma transação que adquiriu o FOR UPDATE.
+	tx := beginTx(t, pool)
+
+	lockedWallet, err := repo.GetByIDForUpdate(ctx, tx, wallet.ID)
+	if err != nil {
+		t.Fatalf("GetByIDForUpdate() error = %v", err)
+	}
+
+	amount, err := domain.NewMoney(5000, lockedWallet.Currency)
+	if err != nil {
+		t.Fatalf("NewMoney() error = %v", err)
+	}
+
+	if err := lockedWallet.Credit(amount); err != nil {
+		t.Fatalf("Credit() error = %v", err)
+	}
+
+	// A version NÃO é incrementada aqui: é responsabilidade do Update (persistência).
+	if err := repo.Update(ctx, tx, lockedWallet); err != nil {
+		t.Fatalf("Update() error = %v", err)
+	}
+
+	if lockedWallet.Version != 2 {
+		t.Errorf("lockedWallet.Version after Update = %d, want 2", lockedWallet.Version)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+
+	updated, err := repo.GetByID(ctx, wallet.ID)
+	if err != nil {
+		t.Fatalf("GetByID() error = %v", err)
+	}
+
+	if want := int64(12345 + 5000); updated.Balance.Cents() != want {
+		t.Errorf("Balance = %d, want %d", updated.Balance.Cents(), want)
+	}
+	if updated.Version != 2 {
+		t.Errorf("Version = %d, want 2", updated.Version)
+	}
+}
