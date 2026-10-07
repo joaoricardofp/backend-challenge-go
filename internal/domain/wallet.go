@@ -5,7 +5,10 @@ import (
 	"fmt"
 )
 
-var ErrWalletNotFound = errors.New("wallet not found")
+var (
+	ErrWalletNotFound       = errors.New("wallet not found")
+	ErrWalletPlayerMismatch = errors.New("wallet does not belong to player")
+)
 
 type Wallet struct {
 	ID       string

@@ -11,6 +11,7 @@ const (
 
 var (
 	ErrInvalidLedgerDirection = errors.New("invalid ledger direction")
+	ErrInvalidLedgerBalance   = errors.New("invalid ledger balance")
 )
 
 type LedgerEntry struct {
@@ -55,6 +56,25 @@ func NewLedgerEntry(
 	if amount.Currency() != balanceBefore.Currency() ||
 		amount.Currency() != balanceAfter.Currency() {
 		return nil, ErrCurrencyMismatch
+	}
+
+	expected := balanceBefore
+
+	var err error
+
+	switch direction {
+	case LedgerCredit:
+		expected, err = balanceBefore.Add(amount)
+	case LedgerDebit:
+		expected, err = balanceBefore.Sub(amount)
+	}
+
+	if err != nil {
+		return nil, err
+	}
+
+	if expected.Cents() != balanceAfter.Cents() {
+		return nil, ErrInvalidLedgerBalance
 	}
 
 	return &LedgerEntry{

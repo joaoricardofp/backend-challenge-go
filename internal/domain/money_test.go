@@ -206,3 +206,107 @@ func TestMoney_Equality(t *testing.T) {
 		t.Errorf("expected %+v == %+v", a, b)
 	}
 }
+
+func TestNewMoneyFromDecimal(t *testing.T) {
+	tests := []struct {
+		name         string
+		amount       string
+		currency     string
+		wantCents    int64
+		wantCurrency string
+		wantErr      error
+	}{
+		{name: "zero", amount: "0.00", currency: "BRL", wantCents: 0, wantCurrency: "BRL"},
+		{name: "positive", amount: "25.00", currency: "BRL", wantCents: 2500, wantCurrency: "BRL"},
+		{name: "with cents", amount: "123456.78", currency: "BRL", wantCents: 12345678, wantCurrency: "BRL"},
+		{name: "one cent", amount: "0.01", currency: "BRL", wantCents: 1, wantCurrency: "BRL"},
+		{name: "lowercase currency is normalized", amount: "25.00", currency: "brl", wantCents: 2500, wantCurrency: "BRL"},
+
+		{name: "empty string", amount: "", currency: "BRL", wantErr: ErrInvalidAmountFormat},
+		{name: "negative", amount: "-25.00", currency: "BRL", wantErr: ErrNegativeAmount},
+		{name: "negative zero", amount: "-0.00", currency: "BRL", wantErr: ErrNegativeAmount},
+		{name: "scale greater than two", amount: "25.000", currency: "BRL", wantErr: ErrInvalidAmountFormat},
+		{name: "scale less than two", amount: "25.0", currency: "BRL", wantErr: ErrInvalidAmountFormat},
+		{name: "no decimal point", amount: "25", currency: "BRL", wantErr: ErrInvalidAmountFormat},
+		{name: "scientific notation", amount: "1e2", currency: "BRL", wantErr: ErrInvalidAmountFormat},
+		{name: "uppercase scientific notation", amount: "1E2", currency: "BRL", wantErr: ErrInvalidAmountFormat},
+		{name: "nan", amount: "NaN", currency: "BRL", wantErr: ErrInvalidAmountFormat},
+		{name: "infinity", amount: "Infinity", currency: "BRL", wantErr: ErrInvalidAmountFormat},
+		{name: "non numeric string", amount: "abc", currency: "BRL", wantErr: ErrInvalidAmountFormat},
+		{name: "multiple points", amount: "1.2.3", currency: "BRL", wantErr: ErrInvalidAmountFormat},
+		{name: "leading whitespace", amount: " 25.00", currency: "BRL", wantErr: ErrInvalidAmountFormat},
+		{name: "overflow units", amount: "99999999999999999999.00", currency: "BRL", wantErr: ErrOverflow},
+		{name: "overflow cents", amount: "92233720368547758.08", currency: "BRL", wantErr: ErrOverflow},
+		{name: "invalid currency", amount: "25.00", currency: "BR", wantErr: ErrInvalidCurrency},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, err := NewMoneyFromDecimal(tt.amount, tt.currency)
+
+			if tt.wantErr != nil {
+				if !errors.Is(err, tt.wantErr) {
+					t.Fatalf("expected %v, got %v", tt.wantErr, err)
+				}
+				if got != (Money{}) {
+					t.Errorf("expected zero Money on error, got %+v", got)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.Cents() != tt.wantCents {
+				t.Errorf("Cents() = %d, want %d", got.Cents(), tt.wantCents)
+			}
+			if got.Currency() != tt.wantCurrency {
+				t.Errorf("Currency() = %s, want %s", got.Currency(), tt.wantCurrency)
+			}
+		})
+	}
+}
+
+func TestMoney_AmountString(t *testing.T) {
+	tests := []struct {
+		cents int64
+		want  string
+	}{
+		{cents: 0, want: "0.00"},
+		{cents: 1, want: "0.01"},
+		{cents: 2500, want: "25.00"},
+		{cents: 123456, want: "1234.56"},
+		{cents: 12345678, want: "123456.78"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.want, func(t *testing.T) {
+			m := mustMoney(t, tt.cents, "BRL")
+			if got := m.AmountString(); got != tt.want {
+				t.Errorf("AmountString() = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestMoney_DecimalRoundTrip(t *testing.T) {
+	values := []string{
+		"0.00",
+		"0.01",
+		"25.00",
+		"1234.56",
+		"123456.78",
+	}
+
+	for _, v := range values {
+		t.Run(v, func(t *testing.T) {
+			m, err := NewMoneyFromDecimal(v, "BRL")
+			if err != nil {
+				t.Fatalf("NewMoneyFromDecimal: unexpected error: %v", err)
+			}
+			if got := m.AmountString(); got != v {
+				t.Errorf("round-trip = %q, want %q", got, v)
+			}
+		})
+	}
+}
