@@ -165,3 +165,65 @@ func TestLedgerRepository_Create_DuplicateWalletTransaction(t *testing.T) {
 		t.Errorf("sqlstate = %s, want 23505", pgErr.Code)
 	}
 }
+
+func TestLedgerRepository_Create_Rollback(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	ledgerRepo := postgres.NewLedgerRepository(pool)
+	walletRepo := postgres.NewWalletRepository(pool)
+
+	wallet := mustCreateWallet(t, pool, walletRepo)
+	txnID := mustInsertWagerTx(t, pool, wallet.ID, wallet.PlayerID)
+
+	tx := beginTx(t, pool)
+
+	amount, err := domain.NewMoney(5000, "BRL")
+	if err != nil {
+		t.Fatalf("NewMoney() error = %v", err)
+	}
+
+	balanceBefore, err := domain.NewMoney(10000, "BRL")
+	if err != nil {
+		t.Fatalf("NewMoney(balanceBefore) error = %v", err)
+	}
+
+	balanceAfter, err := domain.NewMoney(15000, "BRL")
+	if err != nil {
+		t.Fatalf("NewMoney(balanceAfter) error = %v", err)
+	}
+
+	entry, err := domain.NewLedgerEntry(
+		newUUID(t, pool),
+		wallet.ID,
+		txnID,
+		domain.LedgerCredit,
+		amount,
+		balanceBefore,
+		balanceAfter,
+	)
+	if err != nil {
+		t.Fatalf("NewLedgerEntry() error = %v", err)
+	}
+
+	if err := ledgerRepo.Create(ctx, tx, entry); err != nil {
+		t.Fatalf("Create() error = %v", err)
+	}
+
+	if err := tx.Rollback(ctx); err != nil {
+		t.Fatalf("Rollback() error = %v", err)
+	}
+
+	var count int
+	err = pool.QueryRow(
+		ctx,
+		`SELECT COUNT(*) FROM wallet_ledger_entries WHERE id = $1`,
+		entry.ID,
+	).Scan(&count)
+	if err != nil {
+		t.Fatalf("query ledger entry: %v", err)
+	}
+
+	if count != 0 {
+		t.Fatalf("ledger entry count = %d, want 0", count)
+	}
+}
