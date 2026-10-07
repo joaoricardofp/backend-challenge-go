@@ -135,6 +135,84 @@ func (r *WagerTransactionRepository) GetByProviderExternalID(
 	return r.scanTransaction(tx.QueryRow(ctx, query, providerID, externalTransactionID))
 }
 
+// GetByProviderExternalIDForUpdate é a leitura com lock da referência de uma
+// reversão: mesma busca por (provider_id, external_transaction_id), com
+// FOR UPDATE na mesma pgx.Tx. Serializa reversões concorrentes da mesma
+// referência (ordem global de locks: wallet → reference).
+func (r *WagerTransactionRepository) GetByProviderExternalIDForUpdate(
+	ctx context.Context,
+	tx pgx.Tx,
+	providerID string,
+	externalTransactionID string,
+) (*domain.WagerTransaction, error) {
+	const query = `
+		SELECT
+			id,
+			provider_id,
+			external_transaction_id,
+			idempotency_key,
+			payload_hash,
+			player_id,
+			wallet_id,
+			round_id,
+			game_id,
+			kind,
+			status,
+			amount,
+			currency,
+			reference_external_transaction_id,
+			resulting_balance,
+			failure_code
+		FROM wager_transactions
+		WHERE provider_id = $1
+		  AND external_transaction_id = $2
+		FOR UPDATE
+	`
+
+	return r.scanTransaction(tx.QueryRow(ctx, query, providerID, externalTransactionID))
+}
+
+// FindProcessedReversal retorna a reversão PROCESSED (REFUND ou ROLLBACK)
+// de uma referência identificada por (provider_id,
+// reference_external_transaction_id), ou ErrTransactionNotFound quando não
+// há nenhuma. Reversões não terminais não bloqueiam (A3.2: só PROCESSED
+// conta como reversão bem-sucedida). Não faz lock: a serialização vem do
+// FOR UPDATE na linha da referência, adquirido antes desta consulta.
+func (r *WagerTransactionRepository) FindProcessedReversal(
+	ctx context.Context,
+	tx pgx.Tx,
+	providerID string,
+	referenceExternalTransactionID string,
+) (*domain.WagerTransaction, error) {
+	const query = `
+		SELECT
+			id,
+			provider_id,
+			external_transaction_id,
+			idempotency_key,
+			payload_hash,
+			player_id,
+			wallet_id,
+			round_id,
+			game_id,
+			kind,
+			status,
+			amount,
+			currency,
+			reference_external_transaction_id,
+			resulting_balance,
+			failure_code
+		FROM wager_transactions
+		WHERE provider_id = $1
+		  AND reference_external_transaction_id = $2
+		  AND kind IN ('REFUND', 'ROLLBACK')
+		  AND status = 'PROCESSED'
+		LIMIT 1
+	`
+
+	return r.scanTransaction(tx.QueryRow(ctx, query, providerID, referenceExternalTransactionID))
+}
+
 // GetByIdempotencyKey busca uma transação pelo provider_id + idempotency_key.
 func (r *WagerTransactionRepository) GetByIdempotencyKey(
 	ctx context.Context,

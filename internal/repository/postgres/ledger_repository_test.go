@@ -28,7 +28,7 @@ func mustInsertWagerTx(t *testing.T, pool *pgxpool.Pool, walletID, playerID stri
 		)
 		VALUES (
 			gen_random_uuid(), gen_random_uuid()::text, gen_random_uuid()::text, 'hash',
-			$1, $2, 'BET', 'COMPLETED', 5000, 'BRL'
+			$1, $2, 'BET', 'PROCESSED', 5000, 'BRL'
 		)
 		RETURNING id::text`,
 		playerID, walletID,
@@ -111,9 +111,13 @@ func TestLedgerRepository_Create_DuplicateWalletTransaction(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewMoney() error = %v", err)
 	}
-	balance, err := domain.NewMoney(12345, "BRL")
+	balanceBefore, err := domain.NewMoney(12345, "BRL")
 	if err != nil {
-		t.Fatalf("NewMoney(balance) error = %v", err)
+		t.Fatalf("NewMoney(balanceBefore) error = %v", err)
+	}
+	balanceAfter, err := domain.NewMoney(12345+5000, "BRL")
+	if err != nil {
+		t.Fatalf("NewMoney(balanceAfter) error = %v", err)
 	}
 
 	// First insert: should succeed.
@@ -124,8 +128,8 @@ func TestLedgerRepository_Create_DuplicateWalletTransaction(t *testing.T) {
 		txnID,
 		domain.LedgerCredit,
 		amount,
-		balance,
-		balance,
+		balanceBefore,
+		balanceAfter,
 	)
 	if err != nil {
 		t.Fatalf("NewLedgerEntry() error = %v", err)
@@ -145,8 +149,8 @@ func TestLedgerRepository_Create_DuplicateWalletTransaction(t *testing.T) {
 		txnID,            // same transaction
 		domain.LedgerCredit,
 		amount,
-		balance,
-		balance,
+		balanceBefore,
+		balanceAfter,
 	)
 	if err != nil {
 		t.Fatalf("NewLedgerEntry() error = %v", err)

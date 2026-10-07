@@ -24,6 +24,7 @@ func newTransaction(
 	walletID string,
 	kind domain.WagerTransactionKind,
 	amountCents int64,
+	reference string,
 ) *domain.WagerTransaction {
 	t.Helper()
 
@@ -46,6 +47,7 @@ func newTransaction(
 		"game-1",
 		kind,
 		amount,
+		reference,
 	)
 	if err != nil {
 		t.Fatalf("new wager transaction: %v", err)
@@ -94,7 +96,7 @@ func TestWagerTransactionRepository_CreateAndGetByProviderExternalID(t *testing.
 	providerID := newUUID(t, pool)
 	extTxID := "ext-tx-" + newUUID(t, pool)
 
-	wt := newTransaction(t, pool, providerID, extTxID, "idem-"+extTxID, wallet.ID, domain.TransactionDebit, 5000)
+	wt := newTransaction(t, pool, providerID, extTxID, "idem-"+extTxID, wallet.ID, domain.TransactionBet, 5000, "")
 	mustCreateTransaction(t, pool, repo, wt)
 
 	// Retrieve by provider + external ID
@@ -113,8 +115,8 @@ func TestWagerTransactionRepository_CreateAndGetByProviderExternalID(t *testing.
 	if got.ExternalTransactionID != extTxID {
 		t.Errorf("ExternalTransactionID = %q, want %q", got.ExternalTransactionID, extTxID)
 	}
-	if got.Kind != domain.TransactionDebit {
-		t.Errorf("Kind = %q, want %q", got.Kind, domain.TransactionDebit)
+	if got.Kind != domain.TransactionBet {
+		t.Errorf("Kind = %q, want %q", got.Kind, domain.TransactionBet)
 	}
 	if got.Status != domain.TransactionPending {
 		t.Errorf("Status = %q, want %q", got.Status, domain.TransactionPending)
@@ -137,7 +139,7 @@ func TestWagerTransactionRepository_GetByIdempotencyKey(t *testing.T) {
 	providerID := newUUID(t, pool)
 	idemKey := "idem-" + newUUID(t, pool)
 
-	wt := newTransaction(t, pool, providerID, "ext-"+idemKey, idemKey, wallet.ID, domain.TransactionCredit, 3000)
+	wt := newTransaction(t, pool, providerID, "ext-"+idemKey, idemKey, wallet.ID, domain.TransactionWin, 3000, "")
 	mustCreateTransaction(t, pool, repo, wt)
 
 	tx := beginTx(t, pool)
@@ -152,9 +154,52 @@ func TestWagerTransactionRepository_GetByIdempotencyKey(t *testing.T) {
 	if got.IdempotencyKey != idemKey {
 		t.Errorf("IdempotencyKey = %q, want %q", got.IdempotencyKey, idemKey)
 	}
-	if got.Kind != domain.TransactionCredit {
-		t.Errorf("Kind = %q, want %q", got.Kind, domain.TransactionCredit)
+	if got.Kind != domain.TransactionWin {
+		t.Errorf("Kind = %q, want %q", got.Kind, domain.TransactionWin)
 	}
+}
+
+func TestWagerTransactionRepository_GetByIdempotencyKey_PayloadHash(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	walletRepo := postgres.NewWalletRepository(pool)
+	repo := postgres.NewWagerTransactionRepository(pool)
+
+	wallet := mustCreateWallet(t, pool, walletRepo)
+	providerID := newUUID(t, pool)
+	idemKey := "idem-" + newUUID(t, pool)
+
+	wt := newTransaction(t, pool, providerID, "ext-"+idemKey, idemKey, wallet.ID, domain.TransactionBet, 5000, "")
+
+	fp, err := domain.CanonicalWagerFingerprint(*wt)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	wt.PayloadHash = fp
+	mustCreateTransaction(t, pool, repo, wt)
+
+	tx := beginTx(t, pool)
+	got, err := repo.GetByIdempotencyKey(ctx, tx, providerID, idemKey)
+	if err != nil {
+		t.Fatalf("GetByIdempotencyKey: %v", err)
+	}
+	if got.PayloadHash != fp {
+		t.Errorf("PayloadHash = %q, want fingerprint %q", got.PayloadHash, fp)
+	}
+
+	t.Run("different provider not found", func(t *testing.T) {
+		_, err := repo.GetByIdempotencyKey(ctx, tx, newUUID(t, pool), idemKey)
+		if !errors.Is(err, domain.ErrTransactionNotFound) {
+			t.Fatalf("error = %v, want ErrTransactionNotFound", err)
+		}
+	})
+
+	t.Run("different key not found", func(t *testing.T) {
+		_, err := repo.GetByIdempotencyKey(ctx, tx, providerID, "other-"+idemKey)
+		if !errors.Is(err, domain.ErrTransactionNotFound) {
+			t.Fatalf("error = %v, want ErrTransactionNotFound", err)
+		}
+	})
 }
 
 func TestWagerTransactionRepository_GetByProviderExternalID_NotFound(t *testing.T) {
@@ -192,11 +237,11 @@ func TestWagerTransactionRepository_Create_DuplicateExternalID(t *testing.T) {
 	extTxID := "ext-dup-" + newUUID(t, pool)
 
 	// First transaction
-	wt1 := newTransaction(t, pool, providerID, extTxID, "idem-1-"+newUUID(t, pool), wallet.ID, domain.TransactionDebit, 1000)
+	wt1 := newTransaction(t, pool, providerID, extTxID, "idem-1-"+newUUID(t, pool), wallet.ID, domain.TransactionBet, 1000, "")
 	mustCreateTransaction(t, pool, repo, wt1)
 
 	// Second transaction with same provider_id + external_transaction_id but different idempotency_key
-	wt2 := newTransaction(t, pool, providerID, extTxID, "idem-2-"+newUUID(t, pool), wallet.ID, domain.TransactionDebit, 2000)
+	wt2 := newTransaction(t, pool, providerID, extTxID, "idem-2-"+newUUID(t, pool), wallet.ID, domain.TransactionBet, 2000, "")
 
 	tx := beginTx(t, pool)
 	err := repo.Create(ctx, tx, wt2)
@@ -216,11 +261,11 @@ func TestWagerTransactionRepository_Create_DuplicateIdempotencyKey(t *testing.T)
 	idemKey := "idem-dup-" + newUUID(t, pool)
 
 	// First transaction
-	wt1 := newTransaction(t, pool, providerID, "ext-1-"+newUUID(t, pool), idemKey, wallet.ID, domain.TransactionCredit, 1000)
+	wt1 := newTransaction(t, pool, providerID, "ext-1-"+newUUID(t, pool), idemKey, wallet.ID, domain.TransactionWin, 1000, "")
 	mustCreateTransaction(t, pool, repo, wt1)
 
 	// Second transaction with same provider_id + idempotency_key but different external_transaction_id
-	wt2 := newTransaction(t, pool, providerID, "ext-2-"+newUUID(t, pool), idemKey, wallet.ID, domain.TransactionCredit, 2000)
+	wt2 := newTransaction(t, pool, providerID, "ext-2-"+newUUID(t, pool), idemKey, wallet.ID, domain.TransactionWin, 2000, "")
 
 	tx := beginTx(t, pool)
 	err := repo.Create(ctx, tx, wt2)
@@ -239,10 +284,10 @@ func TestWagerTransactionRepository_UpdateStatus_Complete(t *testing.T) {
 	providerID := newUUID(t, pool)
 	extTxID := "ext-upd-" + newUUID(t, pool)
 
-	wt := newTransaction(t, pool, providerID, extTxID, "idem-"+extTxID, wallet.ID, domain.TransactionDebit, 4000)
+	wt := newTransaction(t, pool, providerID, extTxID, "idem-"+extTxID, wallet.ID, domain.TransactionBet, 4000, "")
 	mustCreateTransaction(t, pool, repo, wt)
 
-	// Mark as completed
+	// Mark as processed
 	balance, err := domain.NewMoney(8345, "BRL")
 	if err != nil {
 		t.Fatalf("new money: %v", err)
@@ -266,8 +311,8 @@ func TestWagerTransactionRepository_UpdateStatus_Complete(t *testing.T) {
 		t.Fatalf("GetByProviderExternalID: %v", err)
 	}
 
-	if got.Status != domain.TransactionCompleted {
-		t.Errorf("Status = %q, want COMPLETED", got.Status)
+	if got.Status != domain.TransactionProcessed {
+		t.Errorf("Status = %q, want PROCESSED", got.Status)
 	}
 	if got.ResultingBalance == nil {
 		t.Fatal("ResultingBalance is nil after update")
@@ -290,7 +335,7 @@ func TestWagerTransactionRepository_UpdateStatus_Fail(t *testing.T) {
 	providerID := newUUID(t, pool)
 	extTxID := "ext-fail-" + newUUID(t, pool)
 
-	wt := newTransaction(t, pool, providerID, extTxID, "idem-"+extTxID, wallet.ID, domain.TransactionDebit, 99999)
+	wt := newTransaction(t, pool, providerID, extTxID, "idem-"+extTxID, wallet.ID, domain.TransactionBet, 99999, "")
 	mustCreateTransaction(t, pool, repo, wt)
 
 	// Mark as failed
@@ -332,7 +377,7 @@ func TestWagerTransactionRepository_UpdateStatus_NotFound(t *testing.T) {
 	amount, _ := domain.NewMoney(1000, "BRL")
 	phantom := &domain.WagerTransaction{
 		ID:     newUUID(t, pool),
-		Status: domain.TransactionCompleted,
+		Status: domain.TransactionProcessed,
 		Amount: amount,
 	}
 
@@ -352,15 +397,14 @@ func TestWagerTransactionRepository_RoundTrip_WithReferenceTransaction(t *testin
 	wallet := mustCreateWallet(t, pool, walletRepo)
 	providerID := newUUID(t, pool)
 
-	// Create original debit
+	// Create original bet
 	extTxID := "ext-orig-" + newUUID(t, pool)
-	original := newTransaction(t, pool, providerID, extTxID, "idem-"+extTxID, wallet.ID, domain.TransactionDebit, 3000)
+	original := newTransaction(t, pool, providerID, extTxID, "idem-"+extTxID, wallet.ID, domain.TransactionBet, 3000, "")
 	mustCreateTransaction(t, pool, repo, original)
 
-	// Create credit referencing the original
+	// Create refund referencing the original
 	refExtTxID := "ext-ref-" + newUUID(t, pool)
-	refund := newTransaction(t, pool, providerID, refExtTxID, "idem-"+refExtTxID, wallet.ID, domain.TransactionCredit, 3000)
-	refund.ReferenceExternalTransactionID = extTxID
+	refund := newTransaction(t, pool, providerID, refExtTxID, "idem-"+refExtTxID, wallet.ID, domain.TransactionRefund, 3000, extTxID)
 
 	mustCreateTransaction(t, pool, repo, refund)
 
@@ -373,7 +417,107 @@ func TestWagerTransactionRepository_RoundTrip_WithReferenceTransaction(t *testin
 	if got.ReferenceExternalTransactionID != extTxID {
 		t.Errorf("ReferenceExternalTransactionID = %q, want %q", got.ReferenceExternalTransactionID, extTxID)
 	}
-	if got.Kind != domain.TransactionCredit {
-		t.Errorf("Kind = %q, want CREDIT", got.Kind)
+	if got.Kind != domain.TransactionRefund {
+		t.Errorf("Kind = %q, want REFUND", got.Kind)
 	}
+}
+
+func TestWagerTransactionRepository_GetByProviderExternalIDForUpdate(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	walletRepo := postgres.NewWalletRepository(pool)
+	repo := postgres.NewWagerTransactionRepository(pool)
+
+	wallet := mustCreateWallet(t, pool, walletRepo)
+	providerID := newUUID(t, pool)
+	extTxID := "ext-lock-" + newUUID(t, pool)
+
+	wt := newTransaction(t, pool, providerID, extTxID, "idem-"+extTxID, wallet.ID, domain.TransactionBet, 3000, "")
+	mustCreateTransaction(t, pool, repo, wt)
+
+	tx := beginTx(t, pool)
+	got, err := repo.GetByProviderExternalIDForUpdate(ctx, tx, providerID, extTxID)
+	if err != nil {
+		t.Fatalf("GetByProviderExternalIDForUpdate: %v", err)
+	}
+	if got.ID != wt.ID {
+		t.Errorf("ID = %q, want %q", got.ID, wt.ID)
+	}
+	if got.Kind != domain.TransactionBet {
+		t.Errorf("Kind = %q, want BET", got.Kind)
+	}
+
+	t.Run("missing returns not found", func(t *testing.T) {
+		_, err := repo.GetByProviderExternalIDForUpdate(ctx, tx, providerID, "nonexistent")
+		if !errors.Is(err, domain.ErrTransactionNotFound) {
+			t.Fatalf("error = %v, want ErrTransactionNotFound", err)
+		}
+	})
+}
+
+func TestWagerTransactionRepository_FindProcessedReversal(t *testing.T) {
+	ctx := context.Background()
+	pool := newTestPool(t)
+	walletRepo := postgres.NewWalletRepository(pool)
+	repo := postgres.NewWagerTransactionRepository(pool)
+
+	wallet := mustCreateWallet(t, pool, walletRepo)
+	providerID := newUUID(t, pool)
+	extTxID := "ext-orig-" + newUUID(t, pool)
+
+	original := newTransaction(t, pool, providerID, extTxID, "idem-"+extTxID, wallet.ID, domain.TransactionBet, 3000, "")
+	mustCreateTransaction(t, pool, repo, original)
+
+	t.Run("missing returns not found", func(t *testing.T) {
+		tx := beginTx(t, pool)
+		_, err := repo.FindProcessedReversal(ctx, tx, providerID, extTxID)
+		if !errors.Is(err, domain.ErrTransactionNotFound) {
+			t.Fatalf("error = %v, want ErrTransactionNotFound", err)
+		}
+	})
+
+	t.Run("pending reversal does not count", func(t *testing.T) {
+		refExtTxID := "ext-pending-" + newUUID(t, pool)
+		pending := newTransaction(t, pool, providerID, refExtTxID, "idem-"+refExtTxID, wallet.ID, domain.TransactionRefund, 3000, extTxID)
+		mustCreateTransaction(t, pool, repo, pending)
+
+		tx := beginTx(t, pool)
+		_, err := repo.FindProcessedReversal(ctx, tx, providerID, extTxID)
+		if !errors.Is(err, domain.ErrTransactionNotFound) {
+			t.Fatalf("error = %v, want ErrTransactionNotFound", err)
+		}
+	})
+
+	t.Run("processed reversal is found", func(t *testing.T) {
+		refExtTxID := "ext-done-" + newUUID(t, pool)
+		reversal := newTransaction(t, pool, providerID, refExtTxID, "idem-"+refExtTxID, wallet.ID, domain.TransactionRefund, 3000, extTxID)
+		balance, err := domain.NewMoney(10000, "BRL")
+		if err != nil {
+			t.Fatalf("new money: %v", err)
+		}
+		if err := reversal.Complete(balance); err != nil {
+			t.Fatalf("complete: %v", err)
+		}
+		mustCreateTransaction(t, pool, repo, reversal)
+
+		tx := beginTx(t, pool)
+		got, err := repo.FindProcessedReversal(ctx, tx, providerID, extTxID)
+		if err != nil {
+			t.Fatalf("FindProcessedReversal: %v", err)
+		}
+		if got.ID != reversal.ID {
+			t.Errorf("ID = %q, want %q", got.ID, reversal.ID)
+		}
+		if got.ReferenceExternalTransactionID != extTxID {
+			t.Errorf("ReferenceExternalTransactionID = %q, want %q", got.ReferenceExternalTransactionID, extTxID)
+		}
+	})
+
+	t.Run("other provider is isolated", func(t *testing.T) {
+		tx := beginTx(t, pool)
+		_, err := repo.FindProcessedReversal(ctx, tx, newUUID(t, pool), extTxID)
+		if !errors.Is(err, domain.ErrTransactionNotFound) {
+			t.Fatalf("error = %v, want ErrTransactionNotFound", err)
+		}
+	})
 }
