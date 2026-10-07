@@ -1,6 +1,11 @@
 package domain
 
-import "fmt"
+import (
+	"errors"
+	"fmt"
+)
+
+var ErrWalletNotFound = errors.New("wallet not found")
 
 type Wallet struct {
 	ID       string
