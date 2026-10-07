@@ -103,3 +103,56 @@ func (r *WalletRepository) GetByID(
 		Version:  version,
 	}, nil
 }
+
+func (r *WalletRepository) GetByIDForUpdate(
+	ctx context.Context,
+	tx pgx.Tx,
+	id string,
+) (*domain.Wallet, error) {
+	const query = `
+	SELECT
+	    id,
+	    player_id,
+	    currency,
+	    balance,
+	    version
+	FROM wallets
+	WHERE id = $1
+	FOR UPDATE`
+
+	var (
+		walletID string
+		playerID string
+		currency string
+		balance  int64
+		version  int64
+	)
+
+	err := tx.QueryRow(ctx, query, id).Scan(
+		&walletID,
+		&playerID,
+		&currency,
+		&balance,
+		&version,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, domain.ErrWalletNotFound
+		}
+
+		return nil, fmt.Errorf("get wallet: %w", err)
+	}
+
+	money, err := domain.NewMoney(balance, currency)
+	if err != nil {
+		return nil, fmt.Errorf("create wallet money: %w", err)
+	}
+
+	return &domain.Wallet{
+		ID:       walletID,
+		PlayerID: playerID,
+		Currency: currency,
+		Balance:  money,
+		Version:  version,
+	}, nil
+}
