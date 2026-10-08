@@ -190,12 +190,8 @@ func TestWalletRepository_Create_DuplicatePlayerCurrency(t *testing.T) {
 		t.Fatal("create second: expected unique violation, got nil")
 	}
 
-	var pgErr *pgconn.PgError
-	if !errors.As(err, &pgErr) {
-		t.Fatalf("error = %v, want *pgconn.PgError", err)
-	}
-	if pgErr.Code != "23505" { // unique_violation
-		t.Errorf("sqlstate = %s, want 23505", pgErr.Code)
+	if !errors.Is(err, postgres.ErrWalletPlayerCurrencyConflict) {
+		t.Fatalf("error = %v, want ErrWalletPlayerCurrencyConflict", err)
 	}
 }
 
