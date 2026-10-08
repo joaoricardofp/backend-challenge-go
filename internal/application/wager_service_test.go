@@ -55,6 +55,7 @@ type serviceFixture struct {
 	service      *application.WagerService
 	wallets      *postgres.WalletRepository
 	transactions *postgres.WagerTransactionRepository
+	outbox       *postgres.OutboxRepository
 }
 
 func newServiceFixture(t *testing.T) *serviceFixture {
@@ -64,12 +65,14 @@ func newServiceFixture(t *testing.T) *serviceFixture {
 	wallets := postgres.NewWalletRepository(pool)
 	transactions := postgres.NewWagerTransactionRepository(pool)
 	ledger := postgres.NewLedgerRepository(pool)
+	outbox := postgres.NewOutboxRepository(pool)
 
 	return &serviceFixture{
 		pool:         pool,
-		service:      application.NewWagerService(pool, wallets, transactions, ledger),
+		service:      application.NewWagerService(pool, wallets, transactions, ledger, outbox),
 		wallets:      wallets,
 		transactions: transactions,
+		outbox:       outbox,
 	}
 }
 
@@ -97,6 +100,9 @@ func (f *serviceFixture) createWallet(t *testing.T, balanceCents int64) *domain.
 
 	t.Cleanup(func() {
 		ctx := context.Background()
+		// A outbox referencia as transactions pelo aggregate_id (sem FK):
+		// limpar antes das transactions para ainda enxergar os IDs.
+		_, _ = f.pool.Exec(ctx, `DELETE FROM outbox_events WHERE aggregate_id IN (SELECT id FROM wager_transactions WHERE wallet_id = $1)`, wallet.ID)
 		_, _ = f.pool.Exec(ctx, "DELETE FROM wallet_ledger_entries WHERE wallet_id = $1", wallet.ID)
 		_, _ = f.pool.Exec(ctx, "DELETE FROM wager_transactions WHERE wallet_id = $1", wallet.ID)
 		_, _ = f.pool.Exec(ctx, "DELETE FROM wallets WHERE id = $1", wallet.ID)

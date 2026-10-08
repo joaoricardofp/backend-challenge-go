@@ -102,39 +102,6 @@ func (r *WagerTransactionRepository) Create(
 	return nil
 }
 
-// GetByProviderExternalID busca uma transação pelo provider_id + external_transaction_id.
-func (r *WagerTransactionRepository) GetByProviderExternalID(
-	ctx context.Context,
-	tx pgx.Tx,
-	providerID string,
-	externalTransactionID string,
-) (*domain.WagerTransaction, error) {
-	const query = `
-		SELECT
-			id,
-			provider_id,
-			external_transaction_id,
-			idempotency_key,
-			payload_hash,
-			player_id,
-			wallet_id,
-			round_id,
-			game_id,
-			kind,
-			status,
-			amount,
-			currency,
-			reference_external_transaction_id,
-			resulting_balance,
-			failure_code
-		FROM wager_transactions
-		WHERE provider_id = $1
-		  AND external_transaction_id = $2
-	`
-
-	return r.scanTransaction(tx.QueryRow(ctx, query, providerID, externalTransactionID))
-}
-
 // GetByProviderExternalIDForUpdate é a leitura com lock da referência de uma
 // reversão: mesma busca por (provider_id, external_transaction_id), com
 // FOR UPDATE na mesma pgx.Tx. Serializa reversões concorrentes da mesma
@@ -377,6 +344,75 @@ func (r *WagerTransactionRepository) scanTransaction(row pgx.Row) (*domain.Wager
 
 	return wt, nil
 }
+
+// GetByID busca uma transação pelo ID (apenas leitura, sem lock).
+func (r *WagerTransactionRepository) GetByID(
+	ctx context.Context,
+	id string,
+) (*domain.WagerTransaction, error) {
+	const query = `
+		SELECT
+			id,
+			provider_id,
+			external_transaction_id,
+			idempotency_key,
+			payload_hash,
+			player_id,
+			wallet_id,
+			round_id,
+			game_id,
+			kind,
+			status,
+			amount,
+			currency,
+			reference_external_transaction_id,
+			resulting_balance,
+			failure_code
+		FROM wager_transactions
+		WHERE id = $1
+	`
+
+	return r.scanTransaction(r.pool.QueryRow(ctx, query, id))
+}
+
+// GetByProviderExternalID busca uma transação pelo provider_id + external_transaction_id (apenas leitura, sem lock).
+func (r *WagerTransactionRepository) GetByProviderExternalID(
+	ctx context.Context,
+	tx pgx.Tx,
+	providerID string,
+	externalTransactionID string,
+) (*domain.WagerTransaction, error) {
+	var row pgx.Row
+	if tx != nil {
+		row = tx.QueryRow(ctx, queryGetByProviderExternalID, providerID, externalTransactionID)
+	} else {
+		row = r.pool.QueryRow(ctx, queryGetByProviderExternalID, providerID, externalTransactionID)
+	}
+	return r.scanTransaction(row)
+}
+
+const queryGetByProviderExternalID = `
+	SELECT
+		id,
+		provider_id,
+		external_transaction_id,
+		idempotency_key,
+		payload_hash,
+		player_id,
+		wallet_id,
+		round_id,
+		game_id,
+		kind,
+		status,
+		amount,
+		currency,
+		reference_external_transaction_id,
+		resulting_balance,
+		failure_code
+	FROM wager_transactions
+	WHERE provider_id = $1
+	  AND external_transaction_id = $2
+`
 
 // classifyInsertError classifica o erro de inserção com base no nome da restrição.
 // Retorna o erro apropriado com base no nome da restrição, ou o erro original se não for reconhecido.

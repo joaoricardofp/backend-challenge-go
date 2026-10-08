@@ -6,11 +6,14 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
 	"github.com/joaoricardofp/backend-challenge-go/internal/application"
+	"github.com/joaoricardofp/backend-challenge-go/internal/auth"
 	"github.com/joaoricardofp/backend-challenge-go/internal/domain"
+	"github.com/joaoricardofp/backend-challenge-go/internal/observability"
 )
 
 // WagerHandler é um adapter fino de transporte: valida o contrato HTTP,
@@ -18,13 +21,15 @@ import (
 // Nenhuma regra financeira vive aqui.
 type WagerHandler struct {
 	service *application.WagerService
+	metrics *observability.Metrics
 }
 
 // NewWagerHandler monta o handler a partir do único use case de wager.
-// O handler guarda somente o service: prova estrutural de que o HTTP não
-// acessa repositories, domínio financeiro direto ou outro use case.
-func NewWagerHandler(service *application.WagerService) *WagerHandler {
-	return &WagerHandler{service: service}
+// O handler guarda somente service e métricas: prova estrutural de que o
+// HTTP não acessa repositories, domínio financeiro direto ou outro use case.
+// metrics pode ser nil (descartadas); logs usam o slog default.
+func NewWagerHandler(service *application.WagerService, metrics *observability.Metrics) *WagerHandler {
+	return &WagerHandler{service: service, metrics: metrics}
 }
 
 // moneyDTO espelha o contrato externo {"amount":"25.00","currency":"BRL"}.
@@ -62,19 +67,34 @@ type errorResponse struct {
 	Message string `json:"message"`
 }
 
-// ProcessWager implementa POST /wagering/transactions.
+// ProcessWager implementa POST /wagering/transactions. Contagem de requests
+// por status vive no middleware (uma única fonte); aqui contam-se apenas
+// desfechos de negócio: transações servidas, rejeições e falhas.
 func (h *WagerHandler) ProcessWager(w http.ResponseWriter, r *http.Request) {
+	// Correlation ID: do middleware, do header validado ou gerado aqui
+	// (chamadas diretas sem middleware). Ecoado na resposta.
+	_, r = observability.EnsureRequestID(w, r)
+	ctx := r.Context()
+	logBase := func(args ...any) []any {
+		base := []any{
+			slog.String("component", "http-wager"),
+			slog.String("method", r.Method),
+		}
+		base = append(base, observability.AttrsFromContext(ctx)...)
+		return append(base, args...)
+	}
+
 	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
+		h.respond(w, ctx, logBase(), http.StatusMethodNotAllowed, "METHOD_NOT_ALLOWED", "method not allowed")
 		return
 	}
 	if ct := r.Header.Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
-		writeError(w, http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "content type must be application/json")
+		h.respond(w, ctx, logBase(), http.StatusUnsupportedMediaType, "UNSUPPORTED_MEDIA_TYPE", "content type must be application/json")
 		return
 	}
 	idempotencyKey := r.Header.Get("Idempotency-Key")
 	if idempotencyKey == "" {
-		writeError(w, http.StatusBadRequest, "MISSING_IDEMPOTENCY_KEY", "Idempotency-Key header is required")
+		h.respond(w, ctx, logBase(), http.StatusBadRequest, "MISSING_IDEMPOTENCY_KEY", "Idempotency-Key header is required")
 		return
 	}
 
@@ -82,7 +102,15 @@ func (h *WagerHandler) ProcessWager(w http.ResponseWriter, r *http.Request) {
 	dec := json.NewDecoder(r.Body)
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&dto); err != nil {
-		writeError(w, http.StatusBadRequest, "INVALID_JSON", "malformed JSON body")
+		h.respond(w, ctx, logBase(), http.StatusBadRequest, "INVALID_JSON", "malformed JSON body")
+		return
+	}
+
+	// OPENING é operação interna: a fronteira externa nunca pode criá-la.
+	// Barrado aqui, antes de qualquer construção de domínio ou chamada ao
+	// use case (o domínio continua aceitando OPENING para uso interno).
+	if dto.Kind == string(domain.TransactionOpening) {
+		h.respond(w, ctx, logBase(slog.String("kind", dto.Kind)), http.StatusBadRequest, "INVALID_KIND", "invalid kind")
 		return
 	}
 
@@ -90,11 +118,18 @@ func (h *WagerHandler) ProcessWager(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		var te *transportError
 		if errors.As(err, &te) {
-			writeError(w, te.status, te.code, te.message)
+			h.respond(w, ctx, logBase(slog.String("kind", dto.Kind)), te.status, te.code, te.message)
 			return
 		}
-		writeError(w, http.StatusBadRequest, "INVALID_REQUEST", "invalid request")
+		h.respond(w, ctx, logBase(), http.StatusBadRequest, "INVALID_REQUEST", "invalid request")
 		return
+	}
+
+	// O providerId efetivo vem da identidade autenticada, nunca do corpo:
+	// quando o middleware validou um principal, ele prevalece. Sem
+	// middleware (fluxos internos/testes), vale o DTO já validado.
+	if principal, ok := auth.PrincipalFrom(r.Context()); ok {
+		tx.ProviderID = principal.ProviderID
 	}
 
 	res, err := h.service.Process(r.Context(), application.ProcessWagerInput{Transaction: tx})
@@ -103,6 +138,22 @@ func (h *WagerHandler) ProcessWager(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		status, code, message := mapAppError(err)
+		fields := logBase(
+			slog.String("kind", string(tx.Kind)),
+			slog.String("failure_code", code),
+			slog.String("provider_id", tx.ProviderID),
+			slog.String("external_transaction_id", tx.ExternalTransactionID),
+		)
+		switch {
+		case isRejectionCode(code):
+			h.metrics.IncWagerRejection(code)
+			slog.InfoContext(ctx, "wager rejected", fields...)
+		case code == "OVERFLOW":
+			h.metrics.IncWagerFailure(code)
+			slog.ErrorContext(ctx, "wager failed", append(fields, slog.String("error", err.Error()))...)
+		default:
+			slog.WarnContext(ctx, "wager error", append(fields, slog.String("error", err.Error()))...)
+		}
 		writeError(w, status, code, message)
 		return
 	}
@@ -111,6 +162,20 @@ func (h *WagerHandler) ProcessWager(w http.ResponseWriter, r *http.Request) {
 	if res.Transaction.Status == domain.TransactionPendingReference {
 		status = http.StatusAccepted
 	}
+	h.metrics.IncWagerTransaction(string(res.Transaction.Kind), string(res.Transaction.Status))
+	if res.Transaction.IsRejected() {
+		h.metrics.IncWagerRejection(res.Transaction.FailureCode)
+	}
+	if res.Transaction.IsFailed() {
+		h.metrics.IncWagerFailure(res.Transaction.FailureCode)
+	}
+	slog.InfoContext(ctx, "wager processed", logBase(
+		slog.String("kind", string(res.Transaction.Kind)),
+		slog.String("status", string(res.Transaction.Status)),
+		slog.String("transaction_id", res.Transaction.ID),
+		slog.String("provider_id", res.Transaction.ProviderID),
+		slog.Bool("idempotent_replay", res.Replayed),
+	)...)
 	writeJSON(w, status, wagerResponse{
 		TransactionID:    res.Transaction.ID,
 		Status:           string(res.Transaction.Status),
@@ -118,6 +183,35 @@ func (h *WagerHandler) ProcessWager(w http.ResponseWriter, r *http.Request) {
 		IdempotentReplay: res.Replayed,
 		FailureCode:      res.Transaction.FailureCode,
 	})
+}
+
+// respond escreve um erro de validação da fronteira com log e métrica.
+// Códigos de transporte (validação de entrada) não são rejeições de negócio
+// persistidas: contam apenas em wager_requests_total.
+func (h *WagerHandler) respond(w http.ResponseWriter, ctx context.Context, fields []any, status int, code, message string) {
+	if status >= 500 {
+		slog.ErrorContext(ctx, "wager request failed", append(fields, slog.String("failure_code", code))...)
+	} else {
+		slog.WarnContext(ctx, "wager request rejected", append(fields, slog.String("failure_code", code))...)
+	}
+	writeError(w, status, code, message)
+}
+
+// isRejectionCode reconhece os códigos de rejeição de negócio persistida
+// (REJECTED). OVERFLOW é FAILED e vai para IncWagerFailure; o resto são
+// erros de validação/conflito/transitórios, não decisões persistidas.
+func isRejectionCode(code string) bool {
+	switch code {
+	case "INSUFFICIENT_FUNDS",
+		"PLAYER_WALLET_MISMATCH",
+		"CURRENCY_MISMATCH",
+		"INVALID_REFERENCE_KIND",
+		"REFERENCE_NOT_PROCESSED",
+		"DUPLICATE_REVERSAL":
+		return true
+	default:
+		return false
+	}
 }
 
 // transportError é um erro de validação do próprio transporte (nunca do domínio).

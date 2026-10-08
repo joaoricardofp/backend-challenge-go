@@ -16,6 +16,7 @@ import (
 
 	"github.com/joaoricardofp/backend-challenge-go/internal/application"
 	"github.com/joaoricardofp/backend-challenge-go/internal/domain"
+	"github.com/joaoricardofp/backend-challenge-go/internal/observability"
 	"github.com/joaoricardofp/backend-challenge-go/internal/repository/postgres"
 	wagerhttp "github.com/joaoricardofp/backend-challenge-go/internal/transport/http"
 )
@@ -26,6 +27,7 @@ type httpFixture struct {
 	pool    *pgxpool.Pool
 	handler *wagerhttp.WagerHandler
 	wallets *postgres.WalletRepository
+	metrics *observability.Metrics
 }
 
 func newHTTPFixture(t *testing.T) *httpFixture {
@@ -47,9 +49,11 @@ func newHTTPFixture(t *testing.T) *httpFixture {
 	wallets := postgres.NewWalletRepository(pool)
 	transactions := postgres.NewWagerTransactionRepository(pool)
 	ledger := postgres.NewLedgerRepository(pool)
-	service := application.NewWagerService(pool, wallets, transactions, ledger)
+	outbox := postgres.NewOutboxRepository(pool)
+	service := application.NewWagerService(pool, wallets, transactions, ledger, outbox)
+	metrics := observability.NewMetrics()
 
-	return &httpFixture{pool: pool, handler: wagerhttp.NewWagerHandler(service), wallets: wallets}
+	return &httpFixture{pool: pool, handler: wagerhttp.NewWagerHandler(service, metrics), wallets: wallets, metrics: metrics}
 }
 
 func (f *httpFixture) uuid(t *testing.T) string {
@@ -84,6 +88,7 @@ func (f *httpFixture) createWallet(t *testing.T, balanceCents int64) *domain.Wal
 	}
 	t.Cleanup(func() {
 		ctx := context.Background()
+		_, _ = f.pool.Exec(ctx, `DELETE FROM outbox_events WHERE aggregate_id IN (SELECT id FROM wager_transactions WHERE wallet_id = $1)`, wallet.ID)
 		_, _ = f.pool.Exec(ctx, "DELETE FROM wallet_ledger_entries WHERE wallet_id = $1", wallet.ID)
 		_, _ = f.pool.Exec(ctx, "DELETE FROM wager_transactions WHERE wallet_id = $1", wallet.ID)
 		_, _ = f.pool.Exec(ctx, "DELETE FROM wallets WHERE id = $1", wallet.ID)
@@ -446,16 +451,305 @@ func TestWagerHTTP_NoInternalLeak(t *testing.T) {
 }
 
 func TestWagerHTTP_HandlerUsesSingleUseCase(t *testing.T) {
-	// Prova estrutural: o handler guarda somente o *application.WagerService.
-	// Qualquer acesso direto a repository/domínio financeiro pelo transporte
-	// exigiria um campo novo e quebraria este teste de propósito.
-	rt := reflect.TypeOf(wagerhttp.NewWagerHandler(nil)).Elem()
-	if rt.NumField() != 1 {
-		t.Fatalf("WagerHandler fields = %d, want exactly 1", rt.NumField())
+	// Prova estrutural: o handler guarda o *application.WagerService e as
+	// métricas operacionais — e nada mais. Qualquer acesso direto a
+	// repository/domínio financeiro pelo transporte exigiria um campo novo e
+	// quebraria este teste de propósito. Métricas são observabilidade, não
+	// acesso a dados: permitidas explicitamente, sem curingas.
+	rt := reflect.TypeOf(wagerhttp.NewWagerHandler(nil, nil)).Elem()
+	if rt.NumField() != 2 {
+		t.Fatalf("WagerHandler fields = %d, want exactly 2 (service, metrics)", rt.NumField())
 	}
-	field := rt.Field(0)
-	want := reflect.TypeOf((*application.WagerService)(nil))
-	if field.Type != want {
-		t.Fatalf("WagerHandler field = %v, want %v", field.Type, want)
+	if got := rt.Field(0).Type; got != reflect.TypeOf((*application.WagerService)(nil)) {
+		t.Fatalf("WagerHandler field 0 = %v, want *application.WagerService", got)
+	}
+	if got := rt.Field(1).Type; got != reflect.TypeOf((*observability.Metrics)(nil)) {
+		t.Fatalf("WagerHandler field 1 = %v, want *observability.Metrics", got)
+	}
+}
+
+func TestWagerHTTP_OpeningRejectedAtBoundary(t *testing.T) {
+	f := newHTTPFixture(t)
+	wallet := f.createWallet(t, 10000)
+
+	body := fmt.Sprintf(
+		`{"providerId":%q,"externalTransactionId":%q,"playerId":%q,"walletId":%q,`+
+			`"money":{"amount":"100.00","currency":"BRL"},"kind":"OPENING"}`,
+		f.uuid(t), "ext-"+f.uuid(t), wallet.PlayerID, wallet.ID,
+	)
+	rec := f.post(t, http.MethodPost, body, "key-"+f.uuid(t), "application/json")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if decodeBody(t, rec)["code"] != "INVALID_KIND" {
+		t.Errorf("code = %v, want INVALID_KIND", decodeBody(t, rec)["code"])
+	}
+
+	// A fronteira barrou antes do use case: o service processaria OPENING
+	// normalmente, então ausência total de persistência prova a não-chamada.
+	var txCount int
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM wager_transactions WHERE wallet_id = $1`, wallet.ID,
+	).Scan(&txCount); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if txCount != 0 {
+		t.Errorf("transactions = %d, want 0 (service not called)", txCount)
+	}
+	stored, err := f.wallets.GetByID(context.Background(), wallet.ID)
+	if err != nil {
+		t.Fatalf("get wallet: %v", err)
+	}
+	if stored.Balance.Cents() != 10000 || stored.Version != 1 {
+		t.Errorf("wallet = %d/v%d, want 10000/v1", stored.Balance.Cents(), stored.Version)
+	}
+	var ledgerCount int
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM wallet_ledger_entries WHERE wallet_id = $1`, wallet.ID,
+	).Scan(&ledgerCount); err != nil {
+		t.Fatalf("count ledger: %v", err)
+	}
+	if ledgerCount != 0 {
+		t.Errorf("ledger entries = %d, want 0", ledgerCount)
+	}
+}
+
+func TestWagerHTTP_ResponseShapesFrozen(t *testing.T) {
+	f := newHTTPFixture(t)
+	wallet := f.createWallet(t, 10000)
+	providerID := f.uuid(t)
+	extTxID := "ext-" + f.uuid(t)
+	key := "key-" + f.uuid(t)
+	body := betBody(providerID, extTxID, wallet.PlayerID, wallet.ID, "30.00", "BRL")
+
+	assertKeys := func(t *testing.T, body map[string]any, want []string) {
+		t.Helper()
+		if len(body) != len(want) {
+			t.Fatalf("keys = %v, want exactly %v", keysOf(body), want)
+		}
+		for _, k := range want {
+			if _, ok := body[k]; !ok {
+				t.Fatalf("keys = %v, want exactly %v", keysOf(body), want)
+			}
+		}
+	}
+
+	first := f.post(t, http.MethodPost, body, key, "application/json")
+	if first.Code != http.StatusOK {
+		t.Fatalf("status = %d", first.Code)
+	}
+	firstBody := decodeBody(t, first)
+	assertKeys(t, firstBody, []string{"transactionId", "status", "balance", "idempotentReplay"})
+	if bal, _ := firstBody["balance"].(map[string]any); len(bal) != 2 {
+		t.Errorf("balance keys = %v, want exactly [amount currency]", keysOf(bal))
+	}
+
+	second := f.post(t, http.MethodPost, body, key, "application/json")
+	secondBody := decodeBody(t, second)
+	assertKeys(t, secondBody, []string{"transactionId", "status", "balance", "idempotentReplay"})
+	if secondBody["idempotentReplay"] != true {
+		t.Errorf("idempotentReplay = %v, want true", secondBody["idempotentReplay"])
+	}
+
+	errRec := f.post(t, http.MethodPost, body, key, "application/json")
+	if errRec.Code != http.StatusOK {
+		t.Fatalf("third identical post status = %d, want 200", errRec.Code)
+	}
+	conflictBody := betBody(providerID, "ext-"+f.uuid(t), wallet.PlayerID, wallet.ID, "50.00", "BRL")
+	conflict := f.post(t, http.MethodPost, conflictBody, key, "application/json")
+	assertKeys(t, decodeBody(t, conflict), []string{"code", "message"})
+}
+
+func keysOf(m map[string]any) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+func TestWagerHTTP_RejectedReplayCarriesFailureCode(t *testing.T) {
+	f := newHTTPFixture(t)
+	wallet := f.createWallet(t, 10000)
+	providerID := f.uuid(t)
+	extTxID := "ext-" + f.uuid(t)
+	key := "key-" + f.uuid(t)
+	body := betBody(providerID, extTxID, wallet.PlayerID, wallet.ID, "200.00", "BRL")
+
+	first := f.post(t, http.MethodPost, body, key, "application/json")
+	if first.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", first.Code)
+	}
+
+	second := f.post(t, http.MethodPost, body, key, "application/json")
+	if second.Code != http.StatusOK {
+		t.Fatalf("replay status = %d, want 200", second.Code)
+	}
+	replay := decodeBody(t, second)
+	if replay["status"] != "REJECTED" {
+		t.Errorf("status = %v, want REJECTED", replay["status"])
+	}
+	if replay["failureCode"] != "INSUFFICIENT_FUNDS" {
+		t.Errorf("failureCode = %v, want INSUFFICIENT_FUNDS", replay["failureCode"])
+	}
+	if replay["idempotentReplay"] != true {
+		t.Errorf("idempotentReplay = %v, want true", replay["idempotentReplay"])
+	}
+}
+
+func TestWagerHTTP_InProgress(t *testing.T) {
+	f := newHTTPFixture(t)
+	wallet := f.createWallet(t, 10000)
+	providerID := f.uuid(t)
+	extTxID := "ext-" + f.uuid(t)
+	key := "key-" + f.uuid(t)
+
+	// Seed PENDING com o fingerprint real do conteúdo que será postado.
+	amount, err := domain.NewMoney(3000, "BRL")
+	if err != nil {
+		t.Fatalf("new money: %v", err)
+	}
+	seed, err := domain.NewWagerTransaction(
+		f.uuid(t), providerID, extTxID, key, "hash-seed",
+		wallet.PlayerID, wallet.ID, "round-987", "fortune-chimp",
+		domain.TransactionBet, amount, "",
+	)
+	if err != nil {
+		t.Fatalf("new wager transaction: %v", err)
+	}
+	fp, err := domain.CanonicalWagerFingerprint(*seed)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+	seed.PayloadHash = fp
+	transactions := postgres.NewWagerTransactionRepository(f.pool)
+	ctx := context.Background()
+	dbTx, err := f.pool.Begin(ctx)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := transactions.Create(ctx, dbTx, seed); err != nil {
+		_ = dbTx.Rollback(ctx)
+		t.Fatalf("seed: %v", err)
+	}
+	if err := dbTx.Commit(ctx); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+	t.Cleanup(func() {
+		_, _ = f.pool.Exec(context.Background(), "DELETE FROM wager_transactions WHERE id = $1", seed.ID)
+	})
+
+	body := betBody(providerID, extTxID, wallet.PlayerID, wallet.ID, "30.00", "BRL")
+	rec := f.post(t, http.MethodPost, body, key, "application/json")
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("status = %d, want 202", rec.Code)
+	}
+	if decodeBody(t, rec)["code"] != "IN_PROGRESS" {
+		t.Errorf("code = %v, want IN_PROGRESS", decodeBody(t, rec)["code"])
+	}
+}
+
+func TestWagerHTTP_MissingKeyCreatesNothing(t *testing.T) {
+
+	f := newHTTPFixture(t)
+	wallet := f.createWallet(t, 10000)
+	body := betBody(f.uuid(t), "ext-"+f.uuid(t), wallet.PlayerID, wallet.ID, "10.00", "BRL")
+
+	rec := f.post(t, http.MethodPost, body, "", "application/json")
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+
+	var n int
+	if err := f.pool.QueryRow(context.Background(),
+		`SELECT COUNT(*) FROM wager_transactions WHERE wallet_id = $1`, wallet.ID,
+	).Scan(&n); err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("transactions = %d, want 0 (use case not reached)", n)
+	}
+}
+
+func postWithRequestID(t *testing.T, f *httpFixture, body, key, requestID string) *httptest.ResponseRecorder {
+	t.Helper()
+
+	req := httptest.NewRequest(http.MethodPost, "/wagering/transactions", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Idempotency-Key", key)
+	if requestID != "" {
+		req.Header.Set("X-Request-ID", requestID)
+	}
+	rec := httptest.NewRecorder()
+	f.handler.ProcessWager(rec, req)
+	return rec
+}
+
+func TestWagerHTTP_RequestIDEchoed(t *testing.T) {
+	f := newHTTPFixture(t)
+	wallet := f.createWallet(t, 10000)
+	body := betBody(f.uuid(t), "ext-"+f.uuid(t), wallet.PlayerID, wallet.ID, "10.00", "BRL")
+
+	// ID válido do cliente é ecoado.
+	rec := postWithRequestID(t, f, body, "key-"+f.uuid(t), "client-req-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (%s)", rec.Code, rec.Body.String())
+	}
+	if got := rec.Header().Get("X-Request-ID"); got != "client-req-1" {
+		t.Errorf("X-Request-ID = %q, want client-req-1", got)
+	}
+
+	// Ausente: gerado e ecoado.
+	rec = postWithRequestID(t, f, body, "key-"+f.uuid(t), "")
+	if got := rec.Header().Get("X-Request-ID"); got == "" {
+		t.Error("missing X-Request-ID echo for generated ID")
+	}
+
+	// Inválido: substituído, nunca ecoado cru.
+	rec = postWithRequestID(t, f, body, "key-"+f.uuid(t), "bad\nid")
+	if got := rec.Header().Get("X-Request-ID"); got == "bad\nid" || got == "" {
+		t.Errorf("X-Request-ID = %q, want generated replacement", got)
+	}
+}
+
+func TestWagerHTTP_OutcomeMetrics(t *testing.T) {
+	f := newHTTPFixture(t)
+
+	// Sucesso conta transação por kind/status.
+	wallet := f.createWallet(t, 10000)
+	okBody := betBody(f.uuid(t), "ext-"+f.uuid(t), wallet.PlayerID, wallet.ID, "30.00", "BRL")
+	if rec := f.post(t, http.MethodPost, okBody, "key-"+f.uuid(t), "application/json"); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if got := f.metrics.Value("wager_transactions_total", map[string]string{"kind": "BET", "status": "PROCESSED"}); got != 1 {
+		t.Errorf("transactions BET/PROCESSED = %d, want 1", got)
+	}
+
+	// Rejeição de negócio conta por failure code.
+	rejWallet := f.createWallet(t, 10000)
+	rejBody := betBody(f.uuid(t), "ext-"+f.uuid(t), rejWallet.PlayerID, rejWallet.ID, "200.00", "BRL")
+	if rec := f.post(t, http.MethodPost, rejBody, "key-"+f.uuid(t), "application/json"); rec.Code != http.StatusUnprocessableEntity {
+		t.Fatalf("status = %d, want 422", rec.Code)
+	}
+	if got := f.metrics.Value("wager_transaction_rejections_total", map[string]string{"failure_code": "INSUFFICIENT_FUNDS"}); got != 1 {
+		t.Errorf("rejections INSUFFICIENT_FUNDS = %d, want 1", got)
+	}
+
+	// Erro de validação não vira transação/rejeição/falha.
+	badBody := betBody(f.uuid(t), "ext-"+f.uuid(t), wallet.PlayerID, wallet.ID, "10.00", "BRL")
+	if rec := f.post(t, http.MethodPost, badBody, "", "application/json"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if got := f.metrics.Value("wager_transactions_total", map[string]string{"kind": "BET", "status": "REJECTED"}); got != 0 {
+		t.Errorf("unexpected rejected transaction count = %d", got)
+	}
+
+	// Exposição sem labels de alta cardinalidade.
+	var b strings.Builder
+	f.metrics.WritePrometheus(&b)
+	for _, forbidden := range []string{"transactionId=", "externalTransactionId=", "idempotencyKey=", "providerId=", "walletId="} {
+		if strings.Contains(b.String(), forbidden) {
+			t.Errorf("metrics leak high-cardinality label %q", forbidden)
+		}
 	}
 }

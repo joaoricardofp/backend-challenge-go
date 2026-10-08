@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -46,21 +47,25 @@ type WagerService struct {
 	wallets      *postgres.WalletRepository
 	transactions *postgres.WagerTransactionRepository
 	ledger       *postgres.LedgerRepository
+	outbox       *postgres.OutboxRepository
 }
 
 // NewWagerService monta o service a partir do pool e dos repositories
-// existentes, que já operam sobre pgx.Tx.
+// existentes, que já operam sobre pgx.Tx. A outbox é obrigatória: cada
+// decisão persistida gera seu evento na mesma transação do financeiro.
 func NewWagerService(
 	pool *pgxpool.Pool,
 	wallets *postgres.WalletRepository,
 	transactions *postgres.WagerTransactionRepository,
 	ledger *postgres.LedgerRepository,
+	outbox *postgres.OutboxRepository,
 ) *WagerService {
 	return &WagerService{
 		pool:         pool,
 		wallets:      wallets,
 		transactions: transactions,
 		ledger:       ledger,
+		outbox:       outbox,
 	}
 }
 
@@ -83,7 +88,13 @@ func NewWagerService(
 //	INSERT wager_transaction (PENDING)
 //	INSERT ledger (somente com movimento)
 //	UPDATE wager_transaction -> PROCESSED + resulting_balance
+//	INSERT outbox (decisão + WalletBalanceChanged quando houve movimento)
 //	COMMIT
+//
+// A outbox participa do MESMO commit (B3.11): nunca existe financeiro
+// committed sem o evento correspondente, e falha no INSERT da outbox reverte
+// wallet, transaction e ledger via rollback. Replays e erros sem persistência
+// não geram eventos.
 //
 // Ordem global de locks: wallet → reference (reversões nunca invertem).
 // Reversão sem referência resolvível estaciona como PENDING_REFERENCE, sem
@@ -238,6 +249,7 @@ func (s *WagerService) Process(ctx context.Context, input ProcessWagerInput) (*P
 		return nil, err
 	}
 
+	var movementEntry *domain.LedgerEntry
 	if effect.HasMovement {
 		ledgerID, err := newLedgerID(ctx, pgxTx)
 		if err != nil {
@@ -258,6 +270,7 @@ func (s *WagerService) Process(ctx context.Context, input ProcessWagerInput) (*P
 		if err := s.ledger.Create(ctx, pgxTx, entry); err != nil {
 			return nil, err
 		}
+		movementEntry = entry
 	}
 
 	if err := tx.Complete(wallet.Balance); err != nil {
@@ -265,6 +278,19 @@ func (s *WagerService) Process(ctx context.Context, input ProcessWagerInput) (*P
 	}
 	if err := s.transactions.UpdateStatus(ctx, pgxTx, &tx); err != nil {
 		return nil, err
+	}
+
+	// Outbox transacional (B3.11): os eventos entram na MESMA pgxTx do
+	// financeiro, imediatamente antes do commit. Qualquer falha aqui reverte
+	// wallet, transaction e ledger pelo rollback do defer.
+	now := time.Now().UTC()
+	if err := s.persistDecisionEvent(ctx, pgxTx, &tx, now); err != nil {
+		return nil, err
+	}
+	if effect.HasMovement {
+		if err := s.persistBalanceChangedEvent(ctx, pgxTx, movementEntry, wallet.Version, tx.IdempotencyKey, now); err != nil {
+			return nil, err
+		}
 	}
 
 	if err := pgxTx.Commit(ctx); err != nil {
@@ -447,6 +473,13 @@ func (s *WagerService) persistPendingReference(ctx context.Context, pgxTx pgx.Tx
 	if err := s.transactions.UpdateStatus(ctx, pgxTx, tx); err != nil {
 		return nil, err
 	}
+	// Outbox transacional: o evento de espera entra na mesma pgxTx da
+	// transação PENDING_REFERENCE, antes do commit. Sem movimento, sem
+	// evento de saldo.
+	now := time.Now().UTC()
+	if err := s.persistDecisionEvent(ctx, pgxTx, tx, now); err != nil {
+		return nil, err
+	}
 	if err := pgxTx.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit pending reference: %w", err)
 	}
@@ -470,9 +503,10 @@ func (s *WagerService) persistPendingReference(ctx context.Context, pgxTx pgx.Tx
 //	ErrOverflow             -> FAILED + OVERFLOW (sem resulting balance)
 //
 // A linha PENDING, a transição terminal e a ausência de efeito financeiro
-// (sem wallet update, sem ledger) fazem parte do mesmo commit. Qualquer
-// outro erro é propagado sem persistência: infraestrutura, contexto,
-// wallet inexistente e validações estruturais não viram terminal.
+// (sem wallet update, sem ledger) fazem parte do mesmo commit, junto com o
+// evento da outbox (Rejected ou Failed). Qualquer outro erro é propagado sem
+// persistência: infraestrutura, contexto, wallet inexistente e validações
+// estruturais não viram terminal.
 func (s *WagerService) persistTerminalOutcome(ctx context.Context, pgxTx pgx.Tx, tx *domain.WagerTransaction, wallet *domain.Wallet, opErr error) (*ProcessWagerResult, error) {
 	var failureCode string
 	rejected := false
@@ -518,10 +552,79 @@ func (s *WagerService) persistTerminalOutcome(ctx context.Context, pgxTx pgx.Tx,
 	if err := s.transactions.UpdateStatus(ctx, pgxTx, tx); err != nil {
 		return nil, errors.Join(opErr, err)
 	}
+	// Outbox transacional: o evento de rejeição/falha entra na mesma pgxTx
+	// da linha terminal, antes do commit. Falha aqui reverte a linha
+	// terminal junto (rollback do defer): sem decisão persistida, sem evento.
+	now := time.Now().UTC()
+	if err := s.persistDecisionEvent(ctx, pgxTx, tx, now); err != nil {
+		return nil, errors.Join(opErr, err)
+	}
 	if err := pgxTx.Commit(ctx); err != nil {
 		return nil, errors.Join(opErr, fmt.Errorf("commit terminal outcome: %w", err))
 	}
 	return nil, opErr
+}
+
+// persistDecisionEvent constrói o evento da decisão recém-persistida
+// (PROCESSED, REJECTED, FAILED ou PENDING_REFERENCE) e o insere na mesma
+// pgxTx do financeiro. A identidade lógica do evento é
+// (aggregate_id = tx.ID, event_type), única pela migration 003: o mesmo
+// processamento nunca gera dois eventos iguais. Replays nunca chegam aqui
+// (retornam antes de qualquer escrita), então nenhuma duplicata é esperada;
+// a constraint é a autoridade final.
+func (s *WagerService) persistDecisionEvent(ctx context.Context, pgxTx pgx.Tx, tx *domain.WagerTransaction, now time.Time) error {
+	var ev *domain.WagerEvent
+	var err error
+	switch {
+	case tx.IsProcessed():
+		ev, err = domain.NewWagerTransactionProcessedEvent(tx.ID, *tx, now)
+	case tx.IsRejected():
+		ev, err = domain.NewWagerTransactionRejectedEvent(tx.ID, *tx, now)
+	case tx.IsFailed():
+		ev, err = domain.NewWagerTransactionFailedEvent(tx.ID, *tx, now)
+	case tx.IsPendingReference():
+		ev, err = domain.NewWagerTransactionPendingReferenceEvent(tx.ID, *tx, now)
+	default:
+		return fmt.Errorf("outbox: no decision event for status %q", tx.Status)
+	}
+	if err != nil {
+		return fmt.Errorf("outbox: build decision event: %w", err)
+	}
+	return s.insertOutboxEvent(ctx, pgxTx, ev, tx.ID, now)
+}
+
+// persistBalanceChangedEvent insere o evento de alteração efetiva de saldo na
+// mesma pgxTx, a partir do ledger entry persistido e da versão resultante da
+// wallet. Chamado somente quando houve movimento (happy path com ledger).
+func (s *WagerService) persistBalanceChangedEvent(ctx context.Context, pgxTx pgx.Tx, entry *domain.LedgerEntry, walletVersion int64, correlationID string, now time.Time) error {
+	if entry == nil {
+		return errors.New("outbox: missing ledger entry for balance event")
+	}
+	ev, err := domain.NewWalletBalanceChangedEvent(entry.ID, *entry, walletVersion, correlationID, now)
+	if err != nil {
+		return fmt.Errorf("outbox: build balance event: %w", err)
+	}
+	return s.insertOutboxEvent(ctx, pgxTx, ev, entry.TransactionID, now)
+}
+
+// insertOutboxEvent serializa o envelope (snapshot imutável, sem float) e o
+// insere via OutboxRepository na transação fornecida. Sem publisher, sem
+// SendMessage, sem retry: apenas persistência transacional.
+func (s *WagerService) insertOutboxEvent(ctx context.Context, pgxTx pgx.Tx, ev *domain.WagerEvent, aggregateID string, now time.Time) error {
+	payload, err := ev.Payload()
+	if err != nil {
+		return err
+	}
+	if err := s.outbox.Create(ctx, pgxTx, &postgres.OutboxEvent{
+		ID:          ev.EventID,
+		EventType:   ev.EventType,
+		AggregateID: aggregateID,
+		Payload:     payload,
+		OccurredAt:  now,
+	}); err != nil {
+		return fmt.Errorf("outbox: persist %s: %w", ev.EventType, err)
+	}
+	return nil
 }
 
 // applyMovement aplica o efeito financeiro na wallet em memória usando as
