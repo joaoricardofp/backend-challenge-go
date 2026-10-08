@@ -17,5 +17,36 @@ services:
       timeout: 5s
       retries: 5
 
+  # IdP OIDC de referência (README §2/§4). Sobe sem realm importado: crie o
+  # realm `wager` com um client confidencial e um usuário de serviço, e
+  # configure OIDC_ISSUER=http://localhost:8081/realms/wager e OIDC_AUDIENCE.
+  # Realm/identidades de teste automatizados ficam para a etapa de entrega.
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.0
+    container_name: backend-challenge-keycloak
+    command: start-dev
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    ports:
+      - "8081:8080"
+
+  # SQS local (B3.13): fila de entrada (consumer de wagering), fila de
+  # eventos (publisher da outbox) e DLQ de eventos (tentativas esgotadas).
+  # As filas são criadas automaticamente pelo script init (ready.d).
+  # URLs locais: http://localhost:4566/000000000000/<nome-da-fila>.
+  localstack:
+    image: localstack/localstack:3
+    container_name: backend-challenge-localstack
+    restart: unless-stopped
+    environment:
+      SERVICES: sqs
+    ports:
+      - "4566:4566"
+    volumes:
+      - ./localstack/init/ready.d:/etc/localstack/init/ready.d
+      - localstack_data:/var/lib/localstack
+
 volumes:
   postgres_data:
+  localstack_data:
