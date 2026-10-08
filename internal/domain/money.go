@@ -162,3 +162,13 @@ func (m Money) Sub(other Money) (Money, error) {
 func (m Money) LessThan(other Money) bool {
 	return m.cents < other.cents
 }
+
+// Negate retorna o valor com sinal trocado, para diferenças e cálculos
+// internos (README §6.1). O resultado pode ser negativo e, portanto, não é
+// válido como saldo de carteira nem como amount de movimentação.
+func (m Money) Negate() (Money, error) {
+	if m.cents == math.MinInt64 {
+		return Money{}, ErrOverflow
+	}
+	return Money{cents: -m.cents, currency: m.currency}, nil
+}

@@ -197,6 +197,32 @@ func TestMoney_LessThan(t *testing.T) {
 	}
 }
 
+func TestMoney_Negate(t *testing.T) {
+	pos := mustMoney(t, 250, "BRL")
+	neg, err := pos.Negate()
+	if err != nil {
+		t.Fatalf("negate: %v", err)
+	}
+	if neg.Cents() != -250 || neg.Currency() != "BRL" {
+		t.Errorf("negated = %d %s, want -250 BRL", neg.Cents(), neg.Currency())
+	}
+	back, err := neg.Negate()
+	if err != nil {
+		t.Fatalf("double negate: %v", err)
+	}
+	if back != pos {
+		t.Errorf("double negated = %+v, want %+v", back, pos)
+	}
+	zero := mustMoney(t, 0, "BRL")
+	negZero, err := zero.Negate()
+	if err != nil {
+		t.Fatalf("negate zero: %v", err)
+	}
+	if negZero != zero {
+		t.Errorf("negated zero = %+v, want %+v", negZero, zero)
+	}
+}
+
 func TestMoney_Equality(t *testing.T) {
 	// Money é comparável com ==; a normalização garante que "brl" == "BRL".
 	a := mustMoney(t, 100, "brl")
