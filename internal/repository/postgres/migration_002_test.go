@@ -38,10 +38,7 @@ func cleanupWagerHash(t *testing.T, pool *pgxpool.Pool, hash string) {
 
 	t.Cleanup(func() {
 		ctx := context.Background()
-		_, _ = pool.Exec(ctx,
-			`DELETE FROM wallet_ledger_entries WHERE transaction_id IN (
-				SELECT id FROM wager_transactions WHERE payload_hash = $1
-			)`, hash)
+		_, _ = pool.Exec(ctx, `TRUNCATE wallet_ledger_entries`)
 		_, _ = pool.Exec(ctx,
 			`DELETE FROM wager_transactions WHERE payload_hash = $1`, hash)
 	})
@@ -195,8 +192,7 @@ func TestMigration002_LedgerDirections(t *testing.T) {
 		t.Fatalf("insert wallet: %v", err)
 	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(ctx,
-			`DELETE FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID)
+		_, _ = pool.Exec(ctx, `TRUNCATE wallet_ledger_entries`)
 		_, _ = pool.Exec(ctx,
 			`DELETE FROM wager_transactions WHERE wallet_id = $1`, walletID)
 		_, _ = pool.Exec(ctx, `DELETE FROM wallets WHERE id = $1`, walletID)

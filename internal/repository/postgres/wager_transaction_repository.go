@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -413,6 +414,122 @@ const queryGetByProviderExternalID = `
 	WHERE provider_id = $1
 	  AND external_transaction_id = $2
 `
+
+// GetByIDForUpdate lê uma transação pelo ID com FOR UPDATE na pgx.Tx.
+// Serializa resolvedores concorrentes da mesma linha PENDING_REFERENCE.
+func (r *WagerTransactionRepository) GetByIDForUpdate(
+	ctx context.Context,
+	tx pgx.Tx,
+	id string,
+) (*domain.WagerTransaction, error) {
+	const query = `
+		SELECT
+			id,
+			provider_id,
+			external_transaction_id,
+			idempotency_key,
+			payload_hash,
+			player_id,
+			wallet_id,
+			round_id,
+			game_id,
+			kind,
+			status,
+			amount,
+			currency,
+			reference_external_transaction_id,
+			resulting_balance,
+			failure_code
+		FROM wager_transactions
+		WHERE id = $1
+		FOR UPDATE
+	`
+
+	return r.scanTransaction(tx.QueryRow(ctx, query, id))
+}
+
+// ListDuePendingReferences lista IDs de reversões PENDING_REFERENCE com
+// tentativa devida, em ordem de vencimento. Sem lock: a posse é decidida
+// pelo FOR UPDATE na transação de resolução (guard + status protegem
+// contra processamento duplicado entre instâncias).
+func (r *WagerTransactionRepository) ListDuePendingReferences(
+	ctx context.Context,
+	limit int,
+) ([]string, error) {
+	const query = `
+		SELECT id
+		FROM wager_transactions
+		WHERE status = 'PENDING_REFERENCE'
+		  AND pending_next_attempt_at <= now()
+		ORDER BY pending_next_attempt_at
+		LIMIT $1
+	`
+
+	rows, err := r.pool.Query(ctx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list due pending references: %w", err)
+	}
+	defer rows.Close()
+
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, fmt.Errorf("scan pending reference id: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate pending references: %w", err)
+	}
+	return ids, nil
+}
+
+// UpdatePendingRetry registra uma tentativa de resolução sem desfecho:
+// incrementa pending_attempts e reagenda. O guard de status garante que
+// apenas linhas ainda PENDING_REFERENCE sejam tocadas; retorna false
+// quando outro resolvedor já concluiu a linha.
+func (r *WagerTransactionRepository) UpdatePendingRetry(
+	ctx context.Context,
+	tx pgx.Tx,
+	id string,
+	attempts int32,
+	nextAttempt time.Time,
+) (bool, error) {
+	const query = `
+		UPDATE wager_transactions
+		SET pending_attempts = $2,
+		    pending_next_attempt_at = $3
+		WHERE id = $1
+		  AND status = 'PENDING_REFERENCE'
+	`
+
+	tag, err := tx.Exec(ctx, query, id, attempts, nextAttempt)
+	if err != nil {
+		return false, fmt.Errorf("update pending retry: %w", err)
+	}
+	return tag.RowsAffected() > 0, nil
+}
+
+// GetPendingProgress lê o progresso de tentativas de uma linha dentro da
+// pgx.Tx do resolvedor (leitura pertencente ao lock FOR UPDATE já detido).
+func (r *WagerTransactionRepository) GetPendingProgress(
+	ctx context.Context,
+	tx pgx.Tx,
+	id string,
+) (int32, error) {
+	const query = `
+		SELECT pending_attempts
+		FROM wager_transactions
+		WHERE id = $1
+	`
+
+	var attempts int32
+	if err := tx.QueryRow(ctx, query, id).Scan(&attempts); err != nil {
+		return 0, fmt.Errorf("get pending progress: %w", err)
+	}
+	return attempts, nil
+}
 
 // classifyInsertError classifica o erro de inserção com base no nome da restrição.
 // Retorna o erro apropriado com base no nome da restrição, ou o erro original se não for reconhecido.
