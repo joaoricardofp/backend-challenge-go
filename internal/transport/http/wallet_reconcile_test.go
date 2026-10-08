@@ -85,7 +85,7 @@ func (f *reconcileHTTPFixture) seedWallet(t *testing.T, storedCents, ledgerCents
 	}
 	t.Cleanup(func() {
 		_, _ = f.pool.Exec(ctx, `DELETE FROM outbox_events WHERE aggregate_id IN (SELECT id FROM wager_transactions WHERE wallet_id = $1)`, walletID)
-		_, _ = f.pool.Exec(ctx, `DELETE FROM wallet_ledger_entries WHERE wallet_id = $1`, walletID)
+		_, _ = f.pool.Exec(ctx, `TRUNCATE wallet_ledger_entries`)
 		_, _ = f.pool.Exec(ctx, `DELETE FROM wager_transactions WHERE wallet_id = $1`, walletID)
 		_, _ = f.pool.Exec(ctx, `DELETE FROM wallets WHERE id = $1`, walletID)
 	})

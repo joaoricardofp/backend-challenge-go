@@ -550,6 +550,135 @@ func (s *scopedOutboxStore) MarkDeadLettered(ctx context.Context, tx pgx.Tx, id 
 	return s.real.MarkDeadLettered(ctx, tx, id)
 }
 
+func TestPublisher_TwoPublishersRaceSameOutbox(t *testing.T) {
+	// §13.6 com store real: dois publishers disputam as mesmas linhas.
+	// At-least-once permite envios duplicados, mas nenhum evento pode se
+	// perder e todo corpo enviado deve ser byte a byte igual ao persistido.
+	pool := consumerTestPool(t)
+	wallets := postgres.NewWalletRepository(pool)
+	transactions := postgres.NewWagerTransactionRepository(pool)
+	ledger := postgres.NewLedgerRepository(pool)
+	repo := postgres.NewOutboxRepository(pool)
+	service := application.NewWagerService(pool, wallets, transactions, ledger, repo)
+
+	// Hermeticidade: o store real lista toda a tabela compartilhada; restos
+	// de execuções abortadas não podem vazar para esta disputa.
+	if _, err := pool.Exec(context.Background(), `TRUNCATE outbox_events`); err != nil {
+		t.Fatalf("truncate outbox: %v", err)
+	}
+
+	walletID, playerID := newPublisherUUID(t, pool), newPublisherUUID(t, pool)
+	wallet, err := domain.NewWallet(walletID, playerID, "BRL")
+	if err != nil {
+		t.Fatalf("new wallet: %v", err)
+	}
+	deposit, _ := domain.NewMoney(10000, "BRL")
+	if err := wallet.Credit(deposit); err != nil {
+		t.Fatalf("credit: %v", err)
+	}
+	if err := wallets.Create(context.Background(), wallet); err != nil {
+		t.Fatalf("create wallet: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx := context.Background()
+		_, _ = pool.Exec(ctx, `DELETE FROM outbox_events WHERE aggregate_id IN (SELECT id FROM wager_transactions WHERE wallet_id = $1)`, walletID)
+		_, _ = pool.Exec(ctx, "TRUNCATE wallet_ledger_entries")
+		_, _ = pool.Exec(ctx, "DELETE FROM wager_transactions WHERE wallet_id = $1", walletID)
+		_, _ = pool.Exec(ctx, "DELETE FROM wallets WHERE id = $1", walletID)
+	})
+
+	providerID := newPublisherUUID(t, pool)
+	amount, _ := domain.NewMoney(3000, "BRL")
+	wt, err := domain.NewWagerTransaction(
+		newPublisherUUID(t, pool), providerID, "ext-"+newPublisherUUID(t, pool),
+		"key-"+newPublisherUUID(t, pool), "hash-test",
+		playerID, walletID, "round-1", "game-1",
+		domain.TransactionBet, amount, "",
+	)
+	if err != nil {
+		t.Fatalf("new transaction: %v", err)
+	}
+	if _, err := service.Process(context.Background(), application.ProcessWagerInput{Transaction: *wt}); err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	stored := readOutboxAggregate(t, pool, repo, wt.ID)
+	if len(stored) != 2 {
+		t.Fatalf("outbox rows = %d, want 2", len(stored))
+	}
+	wantBody := map[string]string{}
+	for _, ev := range stored {
+		wantBody[ev.ID] = string(ev.Payload)
+	}
+	// O store real lista TODAS as linhas pendentes da tabela compartilhada;
+	// valida-se abaixo somente os eventos deste teste (por eventId).
+
+	senderA, senderB := &fakeSender{}, &fakeSender{}
+	pubA, err := NewPublisher(pool, repo, senderA, nil, 10, 50*time.Millisecond, 5, 5*time.Minute, true, nil)
+	if err != nil {
+		t.Fatalf("publisher A: %v", err)
+	}
+	pubB, err := NewPublisher(pool, repo, senderB, nil, 10, 50*time.Millisecond, 5, 5*time.Minute, true, nil)
+	if err != nil {
+		t.Fatalf("publisher B: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		for _, p := range []*Publisher{pubA, pubB} {
+			wg.Add(1)
+			go func(p *Publisher) {
+				defer wg.Done()
+				for j := 0; j < 10; j++ {
+					n, err := p.PublishOnce(context.Background())
+					if err != nil {
+						return
+					}
+					if n == 0 {
+						return
+					}
+				}
+			}(p)
+		}
+	}
+	wg.Wait()
+
+	for _, ev := range readOutboxAggregate(t, pool, repo, wt.ID) {
+		var publishedAt *time.Time
+		err := pool.QueryRow(context.Background(),
+			`SELECT published_at FROM outbox_events WHERE id = $1`, ev.ID,
+		).Scan(&publishedAt)
+		if err != nil {
+			t.Fatalf("published_at: %v", err)
+		}
+		if publishedAt == nil {
+			t.Errorf("event %s %s not published after race", ev.ID, ev.EventType)
+		}
+	}
+	sawMine := map[string]int{}
+	for i, bodies := range [][][]byte{senderA.sentBodies(), senderB.sentBodies()} {
+		for _, body := range bodies {
+			var env map[string]any
+			if err := json.Unmarshal(body, &env); err != nil {
+				t.Fatalf("sender %d body not JSON: %v", i, err)
+			}
+			id, _ := env["eventId"].(string)
+			want, ok := wantBody[id]
+			if !ok {
+				continue // linha de outro teste na tabela compartilhada
+			}
+			sawMine[id]++
+			if string(body) != want {
+				t.Errorf("sender %d body for %q differs from stored payload", i, id)
+			}
+		}
+	}
+	for id := range wantBody {
+		if sawMine[id] == 0 {
+			t.Errorf("event %q never sent", id)
+		}
+	}
+}
+
 func TestPublisher_IntegrationWithWagerService(t *testing.T) {
 	// Composição com PostgreSQL real:
 	//   ProcessWager → outbox rows → publisher → fake SQS → MarkPublished.
@@ -577,7 +706,7 @@ func TestPublisher_IntegrationWithWagerService(t *testing.T) {
 	t.Cleanup(func() {
 		ctx := context.Background()
 		_, _ = pool.Exec(ctx, `DELETE FROM outbox_events WHERE aggregate_id IN (SELECT id FROM wager_transactions WHERE wallet_id = $1)`, walletID)
-		_, _ = pool.Exec(ctx, "DELETE FROM wallet_ledger_entries WHERE wallet_id = $1", walletID)
+		_, _ = pool.Exec(ctx, "TRUNCATE wallet_ledger_entries")
 		_, _ = pool.Exec(ctx, "DELETE FROM wager_transactions WHERE wallet_id = $1", walletID)
 		_, _ = pool.Exec(ctx, "DELETE FROM wallets WHERE id = $1", walletID)
 	})
@@ -637,8 +766,14 @@ func TestPublisher_IntegrationWithWagerService(t *testing.T) {
 	if err := json.Unmarshal(bodies[0], &envelope); err != nil {
 		t.Fatalf("unmarshal envelope: %v", err)
 	}
-	if envelope["eventId"] != wt.ID || envelope["eventType"] != domain.EventWagerTransactionProcessed {
+	// eventId é único por linha (uma transação emite vários tipos ao longo
+	// da vida, ex. PENDING_REFERENCE → PROCESSED); a identidade estável é
+	// (aggregate_id, event_type).
+	if envelope["eventType"] != domain.EventWagerTransactionProcessed || envelope["aggregateId"] != wt.ID {
 		t.Errorf("envelope = %v, want decisão da transação %s", envelope, wt.ID)
+	}
+	if eventID, _ := envelope["eventId"].(string); eventID == "" || eventID == wt.ID {
+		t.Errorf("envelope eventId = %q, want unique non-transaction id", eventID)
 	}
 
 	// Replay não cria segundo evento: continua 2 linhas no banco.
@@ -697,7 +832,7 @@ func setupProcessedBet(t *testing.T) (*pgxpool.Pool, *application.WagerService, 
 	t.Cleanup(func() {
 		ctx := context.Background()
 		_, _ = pool.Exec(ctx, `DELETE FROM outbox_events WHERE aggregate_id IN (SELECT id FROM wager_transactions WHERE wallet_id = $1)`, walletID)
-		_, _ = pool.Exec(ctx, "DELETE FROM wallet_ledger_entries WHERE wallet_id = $1", walletID)
+		_, _ = pool.Exec(ctx, "TRUNCATE wallet_ledger_entries")
 		_, _ = pool.Exec(ctx, "DELETE FROM wager_transactions WHERE wallet_id = $1", walletID)
 		_, _ = pool.Exec(ctx, "DELETE FROM wallets WHERE id = $1", walletID)
 	})

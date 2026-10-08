@@ -89,7 +89,7 @@ func (f *httpFixture) createWallet(t *testing.T, balanceCents int64) *domain.Wal
 	t.Cleanup(func() {
 		ctx := context.Background()
 		_, _ = f.pool.Exec(ctx, `DELETE FROM outbox_events WHERE aggregate_id IN (SELECT id FROM wager_transactions WHERE wallet_id = $1)`, wallet.ID)
-		_, _ = f.pool.Exec(ctx, "DELETE FROM wallet_ledger_entries WHERE wallet_id = $1", wallet.ID)
+		_, _ = f.pool.Exec(ctx, "TRUNCATE wallet_ledger_entries")
 		_, _ = f.pool.Exec(ctx, "DELETE FROM wager_transactions WHERE wallet_id = $1", wallet.ID)
 		_, _ = f.pool.Exec(ctx, "DELETE FROM wallets WHERE id = $1", wallet.ID)
 	})
