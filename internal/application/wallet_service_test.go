@@ -422,5 +422,3 @@ func newLedgerEntry(t *testing.T, pool *pgxpool.Pool, walletID, transactionID st
 	}
 	return *entry
 }
-
-

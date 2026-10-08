@@ -75,22 +75,22 @@ type GetTransactionByProviderExternalIDResult struct {
 type ReconciliationIssueType string
 
 const (
-	IssueBalanceMismatch             ReconciliationIssueType = "BALANCE_MISMATCH"
-	IssueFirstBalanceBeforeMismatch  ReconciliationIssueType = "FIRST_BALANCE_BEFORE_MISMATCH"
-	IssueBalanceChainMismatch        ReconciliationIssueType = "BALANCE_CHAIN_MISMATCH"
-	IssueEntryBalanceMismatch        ReconciliationIssueType = "ENTRY_BALANCE_MISMATCH"
-	IssueNegativeBalance             ReconciliationIssueType = "NEGATIVE_BALANCE"
-	IssueInvalidLedgerAmount         ReconciliationIssueType = "INVALID_LEDGER_AMOUNT"
-	IssueUnknownDirection            ReconciliationIssueType = "UNKNOWN_DIRECTION"
+	IssueBalanceMismatch            ReconciliationIssueType = "BALANCE_MISMATCH"
+	IssueFirstBalanceBeforeMismatch ReconciliationIssueType = "FIRST_BALANCE_BEFORE_MISMATCH"
+	IssueBalanceChainMismatch       ReconciliationIssueType = "BALANCE_CHAIN_MISMATCH"
+	IssueEntryBalanceMismatch       ReconciliationIssueType = "ENTRY_BALANCE_MISMATCH"
+	IssueNegativeBalance            ReconciliationIssueType = "NEGATIVE_BALANCE"
+	IssueInvalidLedgerAmount        ReconciliationIssueType = "INVALID_LEDGER_AMOUNT"
+	IssueUnknownDirection           ReconciliationIssueType = "UNKNOWN_DIRECTION"
 )
 
 // ReconciliationIssue representa uma inconsistência encontrada durante a reconciliação.
 type ReconciliationIssue struct {
-	Type        ReconciliationIssueType `json:"type"`
-	EntryID     string                  `json:"entryId,omitempty"`
-	Expected    string                  `json:"expected,omitempty"`
-	Actual      string                  `json:"actual,omitempty"`
-	Message     string                  `json:"message"`
+	Type     ReconciliationIssueType `json:"type"`
+	EntryID  string                  `json:"entryId,omitempty"`
+	Expected string                  `json:"expected,omitempty"`
+	Actual   string                  `json:"actual,omitempty"`
+	Message  string                  `json:"message"`
 }
 
 // ReconciliationInput representa a entrada para a operação de reconciliação.
@@ -100,13 +100,13 @@ type ReconciliationInput struct {
 
 // ReconciliationResult representa o resultado da reconciliação de uma carteira.
 type ReconciliationResult struct {
-	WalletID          string                   `json:"walletId"`
-	StoredBalance     domain.Money             `json:"storedBalance"`
-	CalculatedBalance domain.Money             `json:"calculatedBalance"`
-	Difference        domain.Money             `json:"difference"`
-	Consistent        bool                     `json:"consistent"`
-	CheckedEntries    int                      `json:"checkedEntries"`
-	Issues            []ReconciliationIssue    `json:"issues"`
+	WalletID          string                `json:"walletId"`
+	StoredBalance     domain.Money          `json:"storedBalance"`
+	CalculatedBalance domain.Money          `json:"calculatedBalance"`
+	Difference        domain.Money          `json:"difference"`
+	Consistent        bool                  `json:"consistent"`
+	CheckedEntries    int                   `json:"checkedEntries"`
+	Issues            []ReconciliationIssue `json:"issues"`
 }
 
 type WalletService struct {
@@ -443,8 +443,8 @@ func (s *WalletService) calculateBalanceFromLedger(entries []domain.LedgerEntry,
 	first := entries[0]
 	if first.BalanceBefore.Cents() != 0 {
 		issues = append(issues, ReconciliationIssue{
-			Type:    IssueFirstBalanceBeforeMismatch,
-			EntryID: first.ID,
+			Type:     IssueFirstBalanceBeforeMismatch,
+			EntryID:  first.ID,
 			Expected: "0.00",
 			Actual:   first.BalanceBefore.AmountString(),
 			Message:  "first ledger entry balanceBefore must be zero",
@@ -458,8 +458,8 @@ func (s *WalletService) calculateBalanceFromLedger(entries []domain.LedgerEntry,
 		// Validar direção
 		if entry.Direction != domain.LedgerCredit && entry.Direction != domain.LedgerDebit {
 			issues = append(issues, ReconciliationIssue{
-				Type:    IssueUnknownDirection,
-				EntryID: entry.ID,
+				Type:     IssueUnknownDirection,
+				EntryID:  entry.ID,
 				Expected: "CREDIT or DEBIT",
 				Actual:   string(entry.Direction),
 				Message:  "invalid ledger direction",
@@ -470,8 +470,8 @@ func (s *WalletService) calculateBalanceFromLedger(entries []domain.LedgerEntry,
 		// Validar amount > 0
 		if entry.Amount.IsZero() {
 			issues = append(issues, ReconciliationIssue{
-				Type:    IssueInvalidLedgerAmount,
-				EntryID: entry.ID,
+				Type:     IssueInvalidLedgerAmount,
+				EntryID:  entry.ID,
 				Expected: "> 0",
 				Actual:   "0.00",
 				Message:  "ledger amount must be positive",
@@ -489,16 +489,16 @@ func (s *WalletService) calculateBalanceFromLedger(entries []domain.LedgerEntry,
 		}
 		if err != nil {
 			issues = append(issues, ReconciliationIssue{
-				Type:    IssueEntryBalanceMismatch,
-				EntryID: entry.ID,
+				Type:     IssueEntryBalanceMismatch,
+				EntryID:  entry.ID,
 				Expected: "valid calculation",
 				Actual:   "calculation error",
 				Message:  "failed to calculate expected balanceAfter",
 			})
 		} else if expectedBalanceAfter.Cents() != entry.BalanceAfter.Cents() {
 			issues = append(issues, ReconciliationIssue{
-				Type:    IssueEntryBalanceMismatch,
-				EntryID: entry.ID,
+				Type:     IssueEntryBalanceMismatch,
+				EntryID:  entry.ID,
 				Expected: expectedBalanceAfter.AmountString(),
 				Actual:   entry.BalanceAfter.AmountString(),
 				Message:  "entry balanceAfter does not match balanceBefore ± amount",
@@ -509,8 +509,8 @@ func (s *WalletService) calculateBalanceFromLedger(entries []domain.LedgerEntry,
 		if i > 0 {
 			if entry.BalanceBefore.Cents() != previousBalanceAfter.Cents() {
 				issues = append(issues, ReconciliationIssue{
-					Type:    IssueBalanceChainMismatch,
-					EntryID: entry.ID,
+					Type:     IssueBalanceChainMismatch,
+					EntryID:  entry.ID,
 					Expected: previousBalanceAfter.AmountString(),
 					Actual:   entry.BalanceBefore.AmountString(),
 					Message:  "entry balanceBefore does not match previous entry balanceAfter",
@@ -521,8 +521,8 @@ func (s *WalletService) calculateBalanceFromLedger(entries []domain.LedgerEntry,
 		// Detectar saldo negativo em qualquer ponto
 		if entry.BalanceAfter.Cents() < 0 {
 			issues = append(issues, ReconciliationIssue{
-				Type:    IssueNegativeBalance,
-				EntryID: entry.ID,
+				Type:     IssueNegativeBalance,
+				EntryID:  entry.ID,
 				Expected: ">= 0",
 				Actual:   entry.BalanceAfter.AmountString(),
 				Message:  "negative balance detected in ledger",
@@ -545,8 +545,8 @@ func (s *WalletService) calculateBalanceFromLedger(entries []domain.LedgerEntry,
 		last := entries[len(entries)-1]
 		if calculatedBalance.Cents() != last.BalanceAfter.Cents() {
 			issues = append(issues, ReconciliationIssue{
-				Type:    IssueBalanceMismatch,
-				EntryID: last.ID,
+				Type:     IssueBalanceMismatch,
+				EntryID:  last.ID,
 				Expected: last.BalanceAfter.AmountString(),
 				Actual:   calculatedBalance.AmountString(),
 				Message:  "calculated final balance does not match last ledger entry balanceAfter",

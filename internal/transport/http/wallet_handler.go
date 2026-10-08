@@ -419,20 +419,20 @@ func transactionToResponse(tx domain.WagerTransaction) transactionResponse {
 }
 
 type reconciliationIssueResponse struct {
-	Type    string `json:"type"`
-	EntryID string `json:"entryId,omitempty"`
+	Type     string `json:"type"`
+	EntryID  string `json:"entryId,omitempty"`
 	Expected string `json:"expected,omitempty"`
 	Actual   string `json:"actual,omitempty"`
 	Message  string `json:"message"`
 }
 
 type reconciliationResponse struct {
-	WalletID          string                       `json:"walletId"`
-	StoredBalance     moneyDTO                     `json:"storedBalance"`
-	CalculatedBalance moneyDTO                     `json:"calculatedBalance"`
-	Difference        moneyDTO                     `json:"difference"`
-	Consistent        bool                         `json:"consistent"`
-	CheckedEntries    int                          `json:"checkedEntries"`
+	WalletID          string                        `json:"walletId"`
+	StoredBalance     moneyDTO                      `json:"storedBalance"`
+	CalculatedBalance moneyDTO                      `json:"calculatedBalance"`
+	Difference        moneyDTO                      `json:"difference"`
+	Consistent        bool                          `json:"consistent"`
+	CheckedEntries    int                           `json:"checkedEntries"`
 	Issues            []reconciliationIssueResponse `json:"issues"`
 }
 
@@ -469,8 +469,8 @@ func (h *WalletHandler) ReconcileWallet(w http.ResponseWriter, r *http.Request) 
 	issues := make([]reconciliationIssueResponse, len(res.Issues))
 	for i, issue := range res.Issues {
 		issues[i] = reconciliationIssueResponse{
-			Type:    string(issue.Type),
-			EntryID: issue.EntryID,
+			Type:     string(issue.Type),
+			EntryID:  issue.EntryID,
 			Expected: issue.Expected,
 			Actual:   issue.Actual,
 			Message:  issue.Message,
