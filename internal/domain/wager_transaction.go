@@ -37,6 +37,7 @@ var (
 	ErrExternalTransactionConflict = errors.New("external transaction conflict")
 	ErrInvalidReferenceKind        = errors.New("invalid reference kind")
 	ErrReferenceNotProcessed       = errors.New("reference is not processed")
+	ErrReferenceNotFound           = errors.New("reference not found")
 	ErrDuplicateReversal           = errors.New("reference already reversed")
 )
 
