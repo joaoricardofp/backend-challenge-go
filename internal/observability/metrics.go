@@ -135,6 +135,13 @@ func (m *Metrics) IncOutboxPublishFailure(queue string) {
 // IncOutboxDeadLettered conta eventos descartados para a DLQ.
 func (m *Metrics) IncOutboxDeadLettered() { m.inc("outbox_events_dead_lettered_total", nil) }
 
+// IncWalletReconciliation conta reconciliações de carteira por resultado
+// ("consistent" ou "inconsistent"). Baixa cardinalidade por construção:
+// nenhum ID de negócio é usado como label.
+func (m *Metrics) IncWalletReconciliation(result string) {
+	m.inc("wallet_reconciliations_total", map[string]string{"result": result})
+}
+
 // RecordRequestDuration registra a duração de requisições HTTP em segundos
 // (histograma com buckets de baixa cardinalidade, soma e contagem).
 func (m *Metrics) RecordRequestDuration(duration time.Duration) {

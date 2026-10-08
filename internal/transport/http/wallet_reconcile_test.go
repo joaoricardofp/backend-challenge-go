@@ -20,6 +20,7 @@ type reconcileHTTPFixture struct {
 	handler *wallethttp.WalletHandler
 	chain   http.Handler
 	issuer  *testIssuer
+	metrics *observability.Metrics
 }
 
 func newReconcileHTTPFixture(t *testing.T) *reconcileHTTPFixture {
@@ -33,13 +34,14 @@ func newReconcileHTTPFixture(t *testing.T) *reconcileHTTPFixture {
 		postgres.NewLedgerRepository(f.pool),
 		postgres.NewOutboxRepository(f.pool),
 	)
-	handler := wallethttp.NewWalletHandler(walletService, nil, observability.NewMetrics())
+	metrics := observability.NewMetrics()
+	handler := wallethttp.NewWalletHandler(walletService, nil, metrics)
 
 	iss := newTestIssuer(t)
 	verifier := newTestVerifier(t, iss)
 	chain := wallethttp.RequireInternalServiceAuth(verifier, http.HandlerFunc(handler.ReconcileWallet))
 
-	return &reconcileHTTPFixture{pool: f.pool, handler: handler, chain: chain, issuer: iss}
+	return &reconcileHTTPFixture{pool: f.pool, handler: handler, chain: chain, issuer: iss, metrics: metrics}
 }
 
 func (f *reconcileHTTPFixture) uuid(t *testing.T) string {
@@ -190,6 +192,25 @@ func TestReconcileHTTP(t *testing.T) {
 
 		if existing.Body.String() != missing.Body.String() {
 			t.Errorf("responses differ, existence leaked:\n%s\n%s", existing.Body.String(), missing.Body.String())
+		}
+	})
+
+	t.Run("reconciliation outcomes are counted in metrics", func(t *testing.T) {
+		beforeConsistent := f.metrics.Value("wallet_reconciliations_total", map[string]string{"result": "consistent"})
+		beforeInconsistent := f.metrics.Value("wallet_reconciliations_total", map[string]string{"result": "inconsistent"})
+
+		if rec := f.doReconcile(internalToken, healthyWallet); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d (%s)", rec.Code, rec.Body.String())
+		}
+		if rec := f.doReconcile(internalToken, divergentWallet); rec.Code != http.StatusOK {
+			t.Fatalf("status = %d (%s)", rec.Code, rec.Body.String())
+		}
+
+		if got := f.metrics.Value("wallet_reconciliations_total", map[string]string{"result": "consistent"}); got != beforeConsistent+1 {
+			t.Errorf("consistent count = %d, want %d", got, beforeConsistent+1)
+		}
+		if got := f.metrics.Value("wallet_reconciliations_total", map[string]string{"result": "inconsistent"}); got != beforeInconsistent+1 {
+			t.Errorf("inconsistent count = %d, want %d", got, beforeInconsistent+1)
 		}
 	})
 

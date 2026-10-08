@@ -479,6 +479,11 @@ func (h *WalletHandler) ReconcileWallet(w http.ResponseWriter, r *http.Request) 
 
 	// A reconciliação sempre retorna 200, mesmo se inconsistent
 	// O campo "consistent" indica o resultado
+	result := "consistent"
+	if !res.Consistent {
+		result = "inconsistent"
+	}
+	h.metrics.IncWalletReconciliation(result)
 	h.respondOK(w, ctx, logBase(slog.String("wallet_id", walletID), slog.Bool("consistent", res.Consistent)), reconciliationResponse{
 		WalletID:          res.WalletID,
 		StoredBalance:     moneyDTO{Amount: res.StoredBalance.AmountString(), Currency: res.StoredBalance.Currency()},
