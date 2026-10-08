@@ -49,7 +49,9 @@ var Module = fx.Module("app",
 		fx.Provide(
 			application.NewWagerService,
 			application.NewWalletService,
+			newReferenceResolver,
 		),
+		fx.Invoke(registerReferenceResolverLifecycle),
 	),
 	fx.Module("auth",
 		fx.Provide(newVerifier),
@@ -371,6 +373,48 @@ func newConsumer(
 		true,
 		metrics,
 	)
+}
+
+// newReferenceResolver monta o worker de PENDING_REFERENCE (README §7) a
+// partir do WagerService e da config centralizada. Sem alteração de
+// comportamento dos fluxos síncronos: o worker só conclui linhas que o
+// fluxo síncrono estacionou.
+func newReferenceResolver(service *application.WagerService, cfg config.Config) *application.ReferenceResolver {
+	rcfg := cfg.PendingResolver
+	return application.NewReferenceResolver(service, application.ReferenceResolverConfig{
+		Interval:    time.Duration(rcfg.IntervalSeconds) * time.Second,
+		BatchSize:   int(rcfg.BatchSize),
+		MaxAttempts: rcfg.MaxAttempts,
+		MaxBackoff:  time.Duration(rcfg.MaxBackoffSecond) * time.Second,
+	})
+}
+
+// registerReferenceResolverLifecycle inicia as varreduras sem bloquear o
+// startup do Fx e as encerra de forma limpa no shutdown (cancel + wait,
+// sem goroutine vazando). Desabilitado, não lança goroutine.
+func registerReferenceResolverLifecycle(lc fx.Lifecycle, cfg config.Config, r *application.ReferenceResolver) {
+	if !cfg.PendingResolver.PendingResolverEnabled() {
+		slog.Info("pending reference resolver disabled (set PENDING_RESOLVER_ENABLED=true to enable)",
+			slog.String("component", "app"))
+		return
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	lc.Append(fx.Hook{
+		OnStart: func(context.Context) error {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				_ = r.Run(ctx)
+			}()
+			return nil
+		},
+		OnStop: func(context.Context) error {
+			cancel()
+			wg.Wait()
+			return nil
+		},
+	})
 }
 
 // registerConsumerLifecycle inicia o polling sem bloquear o startup do Fx e

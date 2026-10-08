@@ -95,10 +95,16 @@ func TestProcessWager_OutboxAtomicSuccess(t *testing.T) {
 	assertUnpublished(t, events)
 
 	decided := outboxByType(t, f, input.Transaction.ID, domain.EventWagerTransactionProcessed)
-	if decided.ID != input.Transaction.ID {
-		t.Errorf("decision event id = %q, want tx id %q (identidade estável)", decided.ID, input.Transaction.ID)
+	// Identidade estável é (aggregate_id, event_type); o id da linha é um
+	// UUID próprio, repetido no eventId do envelope (uma transação emite
+	// vários tipos ao longo da vida, ex. PENDING_REFERENCE → PROCESSED).
+	if decided.ID == "" || decided.ID == input.Transaction.ID {
+		t.Errorf("decision event id = %q, want unique non-transaction id", decided.ID)
 	}
 	payload := outboxPayload(t, decided)
+	if payload["eventId"] != decided.ID {
+		t.Errorf("envelope eventId = %v, want row id %q", payload["eventId"], decided.ID)
+	}
 	if payload["eventType"] != domain.EventWagerTransactionProcessed || payload["aggregateId"] != input.Transaction.ID {
 		t.Errorf("envelope = %v", payload)
 	}

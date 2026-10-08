@@ -55,6 +55,52 @@ func TestSQSConfig_Defaults(t *testing.T) {
 	}
 }
 
+func TestPendingResolverConfig_Defaults(t *testing.T) {
+	t.Setenv("PENDING_RESOLVER_ENABLED", "")
+	t.Setenv("PENDING_RESOLVER_INTERVAL_SECONDS", "")
+	t.Setenv("PENDING_RESOLVER_BATCH_SIZE", "")
+	t.Setenv("PENDING_RESOLVER_MAX_ATTEMPTS", "")
+	t.Setenv("PENDING_RESOLVER_MAX_BACKOFF_SECONDS", "")
+
+	cfg := PendingResolverConfigFromEnv()
+	if !cfg.PendingResolverEnabled() {
+		t.Error("Enabled = false, want true (worker exigido pelo README §7)")
+	}
+	if cfg.IntervalSeconds != 5 || cfg.BatchSize != 10 {
+		t.Errorf("poll defaults = %d/%d, want 5/10",
+			cfg.IntervalSeconds, cfg.BatchSize)
+	}
+	if cfg.MaxAttempts != 10 || cfg.MaxBackoffSecond != 300 {
+		t.Errorf("retry defaults = %d/%d, want 10/300",
+			cfg.MaxAttempts, cfg.MaxBackoffSecond)
+	}
+}
+
+func TestPendingResolverConfig_ClampAndDisable(t *testing.T) {
+	t.Setenv("PENDING_RESOLVER_ENABLED", "false")
+	t.Setenv("PENDING_RESOLVER_INTERVAL_SECONDS", "0")
+	t.Setenv("PENDING_RESOLVER_BATCH_SIZE", "5000")
+	t.Setenv("PENDING_RESOLVER_MAX_ATTEMPTS", "0")
+	t.Setenv("PENDING_RESOLVER_MAX_BACKOFF_SECONDS", "99999")
+
+	cfg := PendingResolverConfigFromEnv()
+	if cfg.PendingResolverEnabled() {
+		t.Error("Enabled = true, want false")
+	}
+	if cfg.IntervalSeconds != 1 {
+		t.Errorf("IntervalSeconds = %d, want clamped to 1", cfg.IntervalSeconds)
+	}
+	if cfg.BatchSize != 100 {
+		t.Errorf("BatchSize = %d, want clamped to 100", cfg.BatchSize)
+	}
+	if cfg.MaxAttempts != 1 {
+		t.Errorf("MaxAttempts = %d, want clamped to 1", cfg.MaxAttempts)
+	}
+	if cfg.MaxBackoffSecond != 3600 {
+		t.Errorf("MaxBackoffSecond = %d, want clamped to 3600", cfg.MaxBackoffSecond)
+	}
+}
+
 func TestSQSConfig_QueueGates(t *testing.T) {
 	// Gate geral desligado: nada inicia, mesmo com filas presentes.
 	t.Setenv("SQS_ENABLED", "false")

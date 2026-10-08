@@ -507,25 +507,35 @@ func (s *WagerService) persistPendingReference(ctx context.Context, pgxTx pgx.Tx
 // evento da outbox (Rejected ou Failed). Qualquer outro erro é propagado sem
 // persistência: infraestrutura, contexto, wallet inexistente e validações
 // estruturais não viram terminal.
-func (s *WagerService) persistTerminalOutcome(ctx context.Context, pgxTx pgx.Tx, tx *domain.WagerTransaction, wallet *domain.Wallet, opErr error) (*ProcessWagerResult, error) {
-	var failureCode string
-	rejected := false
+// failureCodeFor traduz um erro de domínio no código de falha estável do
+// contrato (REJECTED com resulting balance, ou FAILED sem). Compartilhado
+// entre o fluxo síncrono e o resolvedor de PENDING_REFERENCE.
+func failureCodeFor(opErr error) (code string, rejected bool, ok bool) {
 	switch {
 	case errors.Is(opErr, domain.ErrInsufficientFunds):
-		failureCode, rejected = "INSUFFICIENT_FUNDS", true
+		return "INSUFFICIENT_FUNDS", true, true
 	case errors.Is(opErr, domain.ErrWalletPlayerMismatch):
-		failureCode, rejected = "PLAYER_WALLET_MISMATCH", true
+		return "PLAYER_WALLET_MISMATCH", true, true
 	case errors.Is(opErr, domain.ErrCurrencyMismatch):
-		failureCode, rejected = "CURRENCY_MISMATCH", true
+		return "CURRENCY_MISMATCH", true, true
 	case errors.Is(opErr, domain.ErrInvalidReferenceKind):
-		failureCode, rejected = "INVALID_REFERENCE_KIND", true
+		return "INVALID_REFERENCE_KIND", true, true
 	case errors.Is(opErr, domain.ErrReferenceNotProcessed):
-		failureCode, rejected = "REFERENCE_NOT_PROCESSED", true
+		return "REFERENCE_NOT_PROCESSED", true, true
+	case errors.Is(opErr, domain.ErrReferenceNotFound):
+		return "REFERENCE_NOT_FOUND", true, true
 	case errors.Is(opErr, domain.ErrDuplicateReversal):
-		failureCode, rejected = "DUPLICATE_REVERSAL", true
+		return "DUPLICATE_REVERSAL", true, true
 	case errors.Is(opErr, domain.ErrOverflow):
-		failureCode, rejected = "OVERFLOW", false
+		return "OVERFLOW", false, true
 	default:
+		return "", false, false
+	}
+}
+
+func (s *WagerService) persistTerminalOutcome(ctx context.Context, pgxTx pgx.Tx, tx *domain.WagerTransaction, wallet *domain.Wallet, opErr error) (*ProcessWagerResult, error) {
+	failureCode, rejected, ok := failureCodeFor(opErr)
+	if !ok {
 		return nil, opErr
 	}
 
@@ -573,17 +583,25 @@ func (s *WagerService) persistTerminalOutcome(ctx context.Context, pgxTx pgx.Tx,
 // (retornam antes de qualquer escrita), então nenhuma duplicata é esperada;
 // a constraint é a autoridade final.
 func (s *WagerService) persistDecisionEvent(ctx context.Context, pgxTx pgx.Tx, tx *domain.WagerTransaction, now time.Time) error {
+	// Cada evento de decisão recebe um eventId próprio (UUID): a identidade
+	// estável é (aggregate_id, event_type) pela migration 003, e uma mesma
+	// transação emite eventos de tipos distintos ao longo da vida
+	// (ex.: PENDING_REFERENCE → PROCESSED). Reutilizar tx.ID como PK
+	// impediria o segundo evento com conflito de primary key.
+	eventID, err := newEventID(ctx, pgxTx)
+	if err != nil {
+		return err
+	}
 	var ev *domain.WagerEvent
-	var err error
 	switch {
 	case tx.IsProcessed():
-		ev, err = domain.NewWagerTransactionProcessedEvent(tx.ID, *tx, now)
+		ev, err = domain.NewWagerTransactionProcessedEvent(eventID, *tx, now)
 	case tx.IsRejected():
-		ev, err = domain.NewWagerTransactionRejectedEvent(tx.ID, *tx, now)
+		ev, err = domain.NewWagerTransactionRejectedEvent(eventID, *tx, now)
 	case tx.IsFailed():
-		ev, err = domain.NewWagerTransactionFailedEvent(tx.ID, *tx, now)
+		ev, err = domain.NewWagerTransactionFailedEvent(eventID, *tx, now)
 	case tx.IsPendingReference():
-		ev, err = domain.NewWagerTransactionPendingReferenceEvent(tx.ID, *tx, now)
+		ev, err = domain.NewWagerTransactionPendingReferenceEvent(eventID, *tx, now)
 	default:
 		return fmt.Errorf("outbox: no decision event for status %q", tx.Status)
 	}
@@ -638,6 +656,17 @@ func applyMovement(wallet *domain.Wallet, effect domain.FinancialEffect) error {
 	default:
 		return domain.ErrInvalidLedgerDirection
 	}
+}
+
+// newEventID gera um UUID via PostgreSQL para identificar um evento da
+// outbox. Cada linha tem eventId próprio; a identidade lógica continua
+// sendo (aggregate_id, event_type).
+func newEventID(ctx context.Context, pgxTx pgx.Tx) (string, error) {
+	var id string
+	if err := pgxTx.QueryRow(ctx, "SELECT gen_random_uuid()::text").Scan(&id); err != nil {
+		return "", fmt.Errorf("generate event id: %w", err)
+	}
+	return id, nil
 }
 
 // newLedgerID gera um UUID via PostgreSQL, sem dependência extra.

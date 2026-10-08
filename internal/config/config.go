@@ -10,12 +10,31 @@ import (
 	"github.com/joaoricardofp/backend-challenge-go/internal/auth"
 )
 
-// Config agrega database, HTTP, OIDC e SQS com os defaults locais já existentes.
+// Config agrega database, HTTP, OIDC, SQS e resolvedor de referências com
+// os defaults locais já existentes.
 type Config struct {
-	DatabaseURL string
-	HTTPAddr    string
-	OIDC        auth.Config
-	SQS         SQSConfig
+	DatabaseURL     string
+	HTTPAddr        string
+	OIDC            auth.Config
+	SQS             SQSConfig
+	PendingResolver PendingResolverConfig
+}
+
+// PendingResolverConfig concentra a configuração do worker de
+// PENDING_REFERENCE (README §7). É a única origem de env do resolvedor.
+// Habilitado por padrão: o polling é uma consulta indexada barata e o
+// worker é exigido para concluir reversões com referência tardia.
+type PendingResolverConfig struct {
+	Enabled          bool
+	IntervalSeconds  int32
+	BatchSize        int32
+	MaxAttempts      int32
+	MaxBackoffSecond int32
+}
+
+// PendingResolverEnabled retorna se o worker deve iniciar.
+func (c PendingResolverConfig) PendingResolverEnabled() bool {
+	return c.Enabled
 }
 
 // SQSConfig concentra a configuração SQS (consumer B3.10 + publisher
@@ -69,10 +88,29 @@ func Load() Config {
 		addr = ":8080"
 	}
 	return Config{
-		DatabaseURL: db,
-		HTTPAddr:    addr,
-		OIDC:        auth.ConfigFromEnv(),
-		SQS:         SQSConfigFromEnv(),
+		DatabaseURL:     db,
+		HTTPAddr:        addr,
+		OIDC:            auth.ConfigFromEnv(),
+		SQS:             SQSConfigFromEnv(),
+		PendingResolver: PendingResolverConfigFromEnv(),
+	}
+}
+
+// PendingResolverConfigFromEnv lê o ambiente do worker de PENDING_REFERENCE.
+// Defaults: habilitado, varredura de 5s, 10 linhas por ciclo, 10 tentativas,
+// teto de backoff de 5 minutos. Valores fora do intervalo são limitados em
+// vez de falhar o boot.
+func PendingResolverConfigFromEnv() PendingResolverConfig {
+	enabled := true
+	if v := strings.TrimSpace(os.Getenv("PENDING_RESOLVER_ENABLED")); v != "" {
+		enabled = v == "true" || v == "1"
+	}
+	return PendingResolverConfig{
+		Enabled:          enabled,
+		IntervalSeconds:  clampInt32(envInt32("PENDING_RESOLVER_INTERVAL_SECONDS", 5), 1, 3600),
+		BatchSize:        clampInt32(envInt32("PENDING_RESOLVER_BATCH_SIZE", 10), 1, 100),
+		MaxAttempts:      clampInt32(envInt32("PENDING_RESOLVER_MAX_ATTEMPTS", 10), 1, 1000),
+		MaxBackoffSecond: clampInt32(envInt32("PENDING_RESOLVER_MAX_BACKOFF_SECONDS", 300), 1, 3600),
 	}
 }
 

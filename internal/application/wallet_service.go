@@ -318,17 +318,22 @@ func (s *WalletService) GetTransactionByProviderExternalID(ctx context.Context, 
 }
 
 func (s *WalletService) persistDecisionEvent(ctx context.Context, pgxTx pgx.Tx, tx *domain.WagerTransaction, now time.Time) error {
+	// EventId próprio por linha (ver WagerService.persistDecisionEvent):
+	// a identidade estável é (aggregate_id, event_type).
+	eventID, err := newEventID(ctx, pgxTx)
+	if err != nil {
+		return err
+	}
 	var ev *domain.WagerEvent
-	var err error
 	switch {
 	case tx.IsProcessed():
-		ev, err = domain.NewWagerTransactionProcessedEvent(tx.ID, *tx, now)
+		ev, err = domain.NewWagerTransactionProcessedEvent(eventID, *tx, now)
 	case tx.IsRejected():
-		ev, err = domain.NewWagerTransactionRejectedEvent(tx.ID, *tx, now)
+		ev, err = domain.NewWagerTransactionRejectedEvent(eventID, *tx, now)
 	case tx.IsFailed():
-		ev, err = domain.NewWagerTransactionFailedEvent(tx.ID, *tx, now)
+		ev, err = domain.NewWagerTransactionFailedEvent(eventID, *tx, now)
 	case tx.IsPendingReference():
-		ev, err = domain.NewWagerTransactionPendingReferenceEvent(tx.ID, *tx, now)
+		ev, err = domain.NewWagerTransactionPendingReferenceEvent(eventID, *tx, now)
 	default:
 		return fmt.Errorf("outbox: no decision event for status %q", tx.Status)
 	}

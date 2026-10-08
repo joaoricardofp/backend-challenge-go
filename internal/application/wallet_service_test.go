@@ -398,7 +398,9 @@ func cleanupTestData(t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	ctx := context.Background()
 	_, _ = pool.Exec(ctx, `DELETE FROM outbox_events`)
-	_, _ = pool.Exec(ctx, `DELETE FROM wallet_ledger_entries`)
+	// Ledger é append-only no banco (trigger bloqueia UPDATE/DELETE):
+	// limpeza de teste usa TRUNCATE.
+	_, _ = pool.Exec(ctx, `TRUNCATE wallet_ledger_entries`)
 	_, _ = pool.Exec(ctx, `DELETE FROM wager_transactions`)
 	_, _ = pool.Exec(ctx, `DELETE FROM wallets`)
 }
